@@ -1,0 +1,2 @@
+# 推荐使用 `uv sync` 或 `pip install -e .` 安装。
+-e .

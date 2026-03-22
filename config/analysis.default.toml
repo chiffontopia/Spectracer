@@ -1,0 +1,18 @@
+# Spectracer 首版分析默认配置（Week 1）
+
+[analysis]
+channel_mode = "stereo"
+fps = 50
+bins_per_semitone = 1.0
+octave_min = 1
+octave_max = 10
+a4_hz = 440.0
+sample_rate = 0  # 0 = 保持原采样率
+
+[render]
+sensitivity = 1.0
+contrast = 1.0
+preview_enabled = true
+
+[processing]
+fingerprint = "raw"

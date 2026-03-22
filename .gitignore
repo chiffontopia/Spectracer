@@ -1,0 +1,17 @@
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+*_cache/
+.benchmarks/
+*.srproj/
+plans/
+!README.md
+tests/__pycache__/
+.benchmarks/
+soundfonts/
+*.mp3
+*.flac
+*.ogg
+*.aac
+.limcode/design/
