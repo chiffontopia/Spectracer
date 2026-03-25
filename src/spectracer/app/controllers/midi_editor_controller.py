@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+from uuid import uuid4
 
 from PyQt6.QtCore import QObject, QPoint, QRectF, Qt
 from PyQt6.QtWidgets import QMenu, QWidget
@@ -44,8 +45,22 @@ class _MoveSelectionInteraction:
 
 
 @dataclass(slots=True)
+class _ResizeSelectionInteraction:
+    anchor_beat: float
+    note_ids: tuple[str, ...]
+    original_notes: tuple[MidiNote, ...]
+
+
+@dataclass(slots=True)
 class _EraseInteraction:
     erased_note_ids: set[str]
+
+
+@dataclass(slots=True, frozen=True)
+class _CopiedNotesClipboard:
+    notes: tuple[MidiNote, ...]
+    anchor_start_beat: float
+    max_end_beat: float
 
 
 class MidiEditorController(QObject):
@@ -73,8 +88,10 @@ class MidiEditorController(QObject):
         self._place_interaction: _PlaceInteraction | None = None
         self._selection_box_interaction: _SelectionBoxInteraction | None = None
         self._move_selection_interaction: _MoveSelectionInteraction | None = None
+        self._resize_selection_interaction: _ResizeSelectionInteraction | None = None
         self._erase_interaction: _EraseInteraction | None = None
         self._active_context_menu: QMenu | None = None
+        self._copied_notes: _CopiedNotesClipboard | None = None
         self._connect_signals()
 
     def close(self) -> None:
@@ -118,6 +135,9 @@ class MidiEditorController(QObject):
         if self._place_interaction is not None:
             self._update_place_preview(event)
             return
+        if self._resize_selection_interaction is not None:
+            self._update_resize_selection_preview(event)
+            return
         if self._move_selection_interaction is not None:
             self._update_move_selection_preview(event)
             return
@@ -130,6 +150,9 @@ class MidiEditorController(QObject):
     def handle_pointer_release(self, event: MidiEditorPointerEvent) -> None:
         if self._place_interaction is not None:
             self._finish_place_interaction(event)
+            return
+        if self._resize_selection_interaction is not None:
+            self._finish_resize_selection_interaction(event)
             return
         if self._move_selection_interaction is not None:
             self._finish_move_selection_interaction(event)
@@ -144,11 +167,15 @@ class MidiEditorController(QObject):
         if not self._editor_state.enabled:
             return
         note = self._view.midi_note_at(request.pointer_event.seconds, request.pointer_event.plot_y)
-        if note is None:
-            return
-        if note.id not in self._session.selected_note_ids:
-            self._session.select_note(note.id)
-        menu = self.build_selection_context_menu(parent=self._menu_host)
+        if note is not None:
+            if note.id not in self._session.selected_note_ids:
+                self._session.select_note(note.id)
+            menu = self.build_selection_context_menu(parent=self._menu_host)
+        else:
+            menu = self.build_blank_context_menu(
+                target_beat=self._absolute_beat_from_pointer(request.pointer_event, snap=False),
+                parent=self._menu_host,
+            )
         if menu is None:
             return
         self._clear_active_context_menu()
@@ -161,6 +188,10 @@ class MidiEditorController(QObject):
         if not selected_notes:
             return None
         menu = QMenu(parent or self._menu_host)
+        copy_action = menu.addAction("复制")
+        paste_action = menu.addAction("粘贴")
+        paste_action.setEnabled(self._copied_notes is not None and bool(self._copied_notes.notes))
+        menu.addSeparator()
         shift_up_action = menu.addAction("上移半音")
         shift_down_action = menu.addAction("下移半音")
         menu.addSeparator()
@@ -168,17 +199,51 @@ class MidiEditorController(QObject):
         menu.addSeparator()
         delete_action = menu.addAction("删除")
 
+        copy_action.triggered.connect(lambda: self.copy_selected_notes())
+        paste_action.triggered.connect(lambda: self.paste_copied_notes())
         shift_up_action.triggered.connect(lambda: self._move_selected_notes_by_semitone(+1))
         shift_down_action.triggered.connect(lambda: self._move_selected_notes_by_semitone(-1))
         properties_action.triggered.connect(lambda: self._edit_selected_note_properties(parent or self._menu_host))
-        delete_action.triggered.connect(self.delete_selected_notes)
+        delete_action.triggered.connect(lambda: self.delete_selected_notes())
         return menu
 
-    def delete_selected_notes(self) -> None:
+    def build_blank_context_menu(self, *, target_beat: float, parent: QWidget | None = None) -> QMenu:
+        menu = QMenu(parent or self._menu_host)
+        paste_action = menu.addAction("在此粘贴")
+        paste_action.setEnabled(self._copied_notes is not None and bool(self._copied_notes.notes))
+        paste_action.triggered.connect(lambda _checked=False, beat=float(target_beat): self.paste_copied_notes(target_beat=beat))
+        return menu
+
+    def delete_selected_notes(self) -> tuple[MidiNote, ...]:
         selected_ids = tuple(self._session.selected_note_ids)
         if not selected_ids:
-            return
-        self._session.remove_notes(selected_ids)
+            return ()
+        return self._session.remove_notes(selected_ids)
+
+    def copy_selected_notes(self) -> tuple[MidiNote, ...]:
+        selected_notes = self._session.selected_notes()
+        if not selected_notes:
+            return ()
+        self._copied_notes = _CopiedNotesClipboard(
+            notes=selected_notes,
+            anchor_start_beat=min(note.start_beat for note in selected_notes),
+            max_end_beat=max(note.end_beat for note in selected_notes),
+        )
+        return selected_notes
+
+    def paste_copied_notes(self, *, target_beat: float | None = None) -> tuple[MidiNote, ...]:
+        clipboard = self._copied_notes
+        if clipboard is None or not clipboard.notes:
+            return ()
+        resolved_target_beat = self._default_paste_target_beat(clipboard) if target_beat is None else float(target_beat)
+        resolved_target_beat = max(0.0, resolved_target_beat)
+        if self._editor_state.snap_enabled:
+            resolved_target_beat = self._editor_state.snap_resolution.quantize(resolved_target_beat)
+        pasted_notes = tuple(
+            note.with_updates(id=uuid4().hex, start_beat=resolved_target_beat + (note.start_beat - clipboard.anchor_start_beat))
+            for note in clipboard.notes
+        )
+        return self._session.add_notes(pasted_notes, select_new=True)
 
     def _connect_signals(self) -> None:
         self._view.midi_editor_pointer_pressed.connect(self.handle_pointer_press)
@@ -199,6 +264,7 @@ class MidiEditorController(QObject):
         self._place_interaction = None
         self._selection_box_interaction = None
         self._move_selection_interaction = None
+        self._resize_selection_interaction = None
         self._erase_interaction = None
         if self._session is not None:
             self._session.commit_command_group()
@@ -244,15 +310,23 @@ class MidiEditorController(QObject):
 
     def _start_select_interaction(self, event: MidiEditorPointerEvent) -> None:
         shift_pressed = self._has_shift_modifier(event)
+        alt_pressed = self._has_alt_modifier(event)
         hit_note = self._view.midi_note_at(event.seconds, event.plot_y)
         if hit_note is not None:
-            if shift_pressed:
+            if shift_pressed and not alt_pressed:
                 self._session.toggle_note_selection(hit_note.id)
                 return
             if hit_note.id not in self._session.selected_note_ids:
                 self._session.select_note(hit_note.id)
             selected_ids = tuple(self._session.selected_note_ids)
             original_notes = tuple(self._session.require_note(note_id) for note_id in selected_ids)
+            if alt_pressed:
+                self._resize_selection_interaction = _ResizeSelectionInteraction(
+                    anchor_beat=self._absolute_beat_from_pointer(event, snap=False),
+                    note_ids=selected_ids,
+                    original_notes=original_notes,
+                )
+                return
             self._move_selection_interaction = _MoveSelectionInteraction(
                 anchor_beat=self._absolute_beat_from_pointer(event, snap=False),
                 anchor_pitch=int(event.midi_pitch),
@@ -303,6 +377,28 @@ class MidiEditorController(QObject):
             return
         if not interaction.additive:
             self._session.clear_selection()
+
+    def _update_resize_selection_preview(self, event: MidiEditorPointerEvent) -> None:
+        interaction = self._resize_selection_interaction
+        if interaction is None:
+            return
+        delta_beats = self._resize_delta_for_pointer(
+            interaction.original_notes,
+            anchor_beat=interaction.anchor_beat,
+            event=event,
+        )
+        self._view.set_midi_preview_rect(self._build_resized_notes_preview_rect(interaction.original_notes, delta_beats))
+
+    def _finish_resize_selection_interaction(self, event: MidiEditorPointerEvent) -> None:
+        interaction = self._resize_selection_interaction
+        self._resize_selection_interaction = None
+        self._view.set_midi_preview_rect(None)
+        if interaction is None:
+            return
+        delta_beats = self._resize_delta_for_pointer(interaction.original_notes, anchor_beat=interaction.anchor_beat, event=event)
+        if abs(delta_beats) <= 1e-9:
+            return
+        self._session.resize_notes(interaction.note_ids, delta_beats=delta_beats)
 
     def _update_move_selection_preview(self, event: MidiEditorPointerEvent) -> None:
         interaction = self._move_selection_interaction
@@ -386,6 +482,25 @@ class MidiEditorController(QObject):
             return beat
         return self._editor_state.snap_resolution.quantize(beat)
 
+    def _default_paste_target_beat(self, clipboard: _CopiedNotesClipboard) -> float:
+        selected_notes = self._session.selected_notes()
+        if selected_notes:
+            return max(note.end_beat for note in selected_notes)
+        return clipboard.max_end_beat
+
+    def _resize_delta_for_pointer(
+        self,
+        original_notes: tuple[MidiNote, ...],
+        *,
+        anchor_beat: float,
+        event: MidiEditorPointerEvent,
+    ) -> float:
+        current_beat = self._absolute_beat_from_pointer(event, snap=False)
+        delta_beats = current_beat - float(anchor_beat)
+        if self._editor_state.snap_enabled:
+            delta_beats = self._quantize_delta(delta_beats)
+        return self._constrain_resize_delta(original_notes, delta_beats)
+
     def _move_delta_for_pointer(
         self,
         original_notes: tuple[MidiNote, ...],
@@ -432,6 +547,19 @@ class MidiEditorController(QObject):
                 rects.append(rect)
         return self._rect_union(rects)
 
+    def _build_resized_notes_preview_rect(
+        self,
+        original_notes: Iterable[MidiNote],
+        delta_beats: float,
+    ) -> QRectF | None:
+        rects: list[QRectF] = []
+        for note in original_notes:
+            resized_note = note.with_updates(duration_beats=note.duration_beats + delta_beats)
+            rect = self._note_rect_for(resized_note)
+            if rect is not None:
+                rects.append(rect)
+        return self._rect_union(rects)
+
     def _note_rect_for(self, note: MidiNote) -> QRectF | None:
         pitch_band = self._view.midi_pitch_band(note.pitch)
         if pitch_band is None:
@@ -468,6 +596,14 @@ class MidiEditorController(QObject):
         constrained_delta_pitch = min(constrained_delta_pitch, 127 - int(max_pitch))
         return constrained_delta_beats, constrained_delta_pitch
 
+    def _constrain_resize_delta(self, notes: Iterable[MidiNote], delta_beats: float) -> float:
+        normalized_notes = tuple(notes)
+        if not normalized_notes:
+            return 0.0
+        minimum_length = self._minimum_note_length_beats() if self._editor_state.snap_enabled else 1e-6
+        lower_bound = max(min(note.duration_beats, minimum_length) - note.duration_beats for note in normalized_notes)
+        return max(float(delta_beats), lower_bound)
+
     def _pointer_drag_started(
         self,
         anchor_seconds: float,
@@ -478,6 +614,9 @@ class MidiEditorController(QObject):
 
     def _has_shift_modifier(self, event: MidiEditorPointerEvent) -> bool:
         return bool(event.modifiers & Qt.KeyboardModifier.ShiftModifier)
+
+    def _has_alt_modifier(self, event: MidiEditorPointerEvent) -> bool:
+        return bool(event.modifiers & Qt.KeyboardModifier.AltModifier)
 
     def _rect_union(self, rects: Iterable[QRectF]) -> QRectF | None:
         rect_list = [QRectF(rect) for rect in rects if rect is not None and not rect.isNull()]

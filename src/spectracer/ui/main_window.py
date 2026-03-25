@@ -467,12 +467,18 @@ class SpectracerMainWindow(QMainWindow):
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.space_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
 
-        self.place_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_E), self)
+        self.edit_mode_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        self.edit_mode_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.place_tool_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         self.place_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.select_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_S), self)
+        self.select_tool_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.select_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.erase_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_D), self)
+        self.erase_tool_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
         self.erase_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.copy_notes_shortcut = QShortcut(QKeySequence("Ctrl+C"), self)
+        self.copy_notes_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.paste_notes_shortcut = QShortcut(QKeySequence("Ctrl+V"), self)
+        self.paste_notes_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
 
         self.central = QWidget(self)
         self.setCentralWidget(self.central)
@@ -508,7 +514,7 @@ class SpectracerMainWindow(QMainWindow):
         editor_controls_layout.setContentsMargins(0, 0, 0, 0)
         editor_controls_layout.setSpacing(8)
         self.edit_mode_checkbox = QCheckBox("编辑模式")
-        self.edit_mode_checkbox.setToolTip("开启后显示 MIDI 覆盖层，并按设定暗化背景热图。")
+        self.edit_mode_checkbox.setToolTip("开启后显示 MIDI 覆盖层，并按设定暗化背景热图。快捷键：Ctrl+E。")
         self.editor_tool_label = QLabel("工具")
         self.editor_tool_group = QButtonGroup(self)
         self.editor_tool_group.setExclusive(True)
@@ -516,9 +522,9 @@ class SpectracerMainWindow(QMainWindow):
         self.place_tool_button = QPushButton("放置")
         self.select_tool_button = QPushButton("选择")
         self.erase_tool_button = QPushButton("擦除")
-        self.place_tool_button.setToolTip("放置工具 (E)")
-        self.select_tool_button.setToolTip("选择工具 (S)")
-        self.erase_tool_button.setToolTip("擦除工具 (D)")
+        self.place_tool_button.setToolTip("放置工具 (Ctrl+W)")
+        self.select_tool_button.setToolTip("选择工具 (Ctrl+S)")
+        self.erase_tool_button.setToolTip("擦除工具 (Ctrl+D)")
         editor_controls_layout.addWidget(self.edit_mode_checkbox)
         editor_controls_layout.addWidget(self.editor_tool_label)
         for button, tool in (
@@ -667,9 +673,12 @@ class SpectracerMainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_audio_dialog)
         self.play_button.clicked.connect(self.toggle_playback)
         self.space_shortcut.activated.connect(self.toggle_playback)
+        self.edit_mode_shortcut.activated.connect(self._toggle_edit_mode_shortcut)
         self.place_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.PLACE, persist=True))
         self.select_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.SELECT, persist=True))
         self.erase_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.ERASE, persist=True))
+        self.copy_notes_shortcut.activated.connect(self._copy_selected_midi_notes)
+        self.paste_notes_shortcut.activated.connect(self._paste_copied_midi_notes)
 
         self.playback_rate_slider.valueChanged.connect(self._on_playback_rate_slider_changed)
         self.playback_rate_reset_button.clicked.connect(self._reset_playback_rate)
@@ -2117,6 +2126,24 @@ class SpectracerMainWindow(QMainWindow):
             f"{self._format_seconds(current_seconds)} / {self._format_seconds(duration_seconds)}"
         )
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        focus_widget = QApplication.focusWidget()
+        focus_in_event_track = focus_widget is not None and (
+            focus_widget is self.event_track_view or self.event_track_view.isAncestorOf(focus_widget)
+        )
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._midi_session.editor_state.enabled
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and not focus_in_event_track
+        ):
+            selected_note_ids = self._midi_session.selected_note_ids
+            self._delete_selected_midi_notes()
+            if selected_note_ids:
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._close_progress_dialog()
         self._panic_preview_notes()
@@ -2178,6 +2205,33 @@ class SpectracerMainWindow(QMainWindow):
 
     def _format_percent_label(self, value: float) -> str:
         return f"{int(round(max(0.0, min(1.0, float(value))) * 100.0))}%"
+
+    def _toggle_edit_mode_shortcut(self) -> None:
+        self._apply_midi_editor_state(
+            self._midi_session.editor_state.with_updates(enabled=not self._midi_session.editor_state.enabled),
+            persist=True,
+        )
+
+    def _copy_selected_midi_notes(self) -> None:
+        if not self._midi_session.editor_state.enabled:
+            return
+        copied_notes = self._midi_editor_controller.copy_selected_notes()
+        if copied_notes:
+            self.status_message.setText(f"已复制 {len(copied_notes)} 个音符")
+
+    def _paste_copied_midi_notes(self) -> None:
+        if not self._midi_session.editor_state.enabled:
+            return
+        pasted_notes = self._midi_editor_controller.paste_copied_notes()
+        if pasted_notes:
+            self.status_message.setText(f"已粘贴 {len(pasted_notes)} 个音符")
+
+    def _delete_selected_midi_notes(self) -> None:
+        if not self._midi_session.editor_state.enabled:
+            return
+        deleted_notes = self._midi_editor_controller.delete_selected_notes()
+        if deleted_notes:
+            self.status_message.setText(f"已删除 {len(deleted_notes)} 个音符")
 
     def _on_edit_mode_toggled(self, enabled: bool) -> None:
         self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(enabled=enabled), persist=True)

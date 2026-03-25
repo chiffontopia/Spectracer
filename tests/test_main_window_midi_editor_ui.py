@@ -291,13 +291,18 @@ def test_main_window_editor_shortcuts_and_session_signals_keep_controls_in_sync(
     window.setFocus()
     qapp.processEvents()
 
-    QTest.keyClick(window, Qt.Key.Key_E)
+    QTest.keyClick(window, Qt.Key.Key_E, Qt.KeyboardModifier.ControlModifier)
+    qapp.processEvents()
+    assert window.edit_mode_checkbox.isChecked() is True
+    assert settings_store["midi_editor/enabled"] is True
+
+    QTest.keyClick(window, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert window.place_tool_button.isChecked() is True
     assert window._midi_session.editor_state.tool is MidiEditorTool.PLACE
     assert settings_store["midi_editor/tool"] == MidiEditorTool.PLACE.value
 
-    QTest.keyClick(window, Qt.Key.Key_D)
+    QTest.keyClick(window, Qt.Key.Key_D, Qt.KeyboardModifier.ControlModifier)
     qapp.processEvents()
     assert window.erase_tool_button.isChecked() is True
     assert window._midi_session.editor_state.tool is MidiEditorTool.ERASE
@@ -322,6 +327,49 @@ def test_main_window_editor_shortcuts_and_session_signals_keep_controls_in_sync(
     assert window.editor_snap_resolution_combo.currentData() == "1/32"
     assert window.editor_darken_slider.value() == 42
     assert "Lead Synth" in window.editor_active_channel_combo.currentText()
+
+    window.close()
+
+
+def test_main_window_midi_clipboard_shortcuts_and_delete_key(monkeypatch: pytest.MonkeyPatch, qapp: QApplication) -> None:
+    settings_store: dict[str, object] = {}
+    _patch_main_window_environment(monkeypatch, settings_store)
+
+    window = SpectracerMainWindow()
+    window.show()
+    window.activateWindow()
+    window.setFocus()
+    window._midi_session.add_note(MidiNote(id="copy-src", pitch=60, start_beat=1.0, duration_beats=0.5), record_undo=False)
+    window._midi_session.select_note("copy-src")
+    qapp.processEvents()
+
+    QTest.keyClick(window, Qt.Key.Key_E, Qt.KeyboardModifier.ControlModifier)
+    qapp.processEvents()
+    assert window._midi_session.editor_state.enabled is True
+
+    QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(window, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    qapp.processEvents()
+
+    assert len(window._midi_session.notes) == 2
+    pasted_note = next(note for note in window._midi_session.notes if note.id != "copy-src")
+    assert pasted_note.start_beat == pytest.approx(1.5)
+    assert pasted_note.duration_beats == pytest.approx(0.5)
+    assert window._midi_session.selected_note_ids == {pasted_note.id}
+    assert window.status_message.text() == "已粘贴 1 个音符"
+
+    window.event_track_view.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(window.event_track_view, Qt.Key.Key_Delete)
+    qapp.processEvents()
+    assert {note.id for note in window._midi_session.notes} == {"copy-src", pasted_note.id}
+
+    window.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(window, Qt.Key.Key_Delete)
+    qapp.processEvents()
+    assert {note.id for note in window._midi_session.notes} == {"copy-src"}
+    assert window.status_message.text() == "已删除 1 个音符"
 
     window.close()
 

@@ -132,6 +132,155 @@ def test_midi_editor_controller_select_tool_supports_click_box_select_and_drag_m
     view.close()
 
 
+def test_midi_editor_controller_supports_copy_paste_and_alt_drag_resize(qapp: QApplication) -> None:
+    notes = (
+        MidiNote(id="copy-a", pitch=60, start_beat=1.0, duration_beats=0.5, channel=1),
+        MidiNote(id="copy-b", pitch=64, start_beat=2.0, duration_beats=0.25, channel=3),
+    )
+    view, session, controller, timeline = _make_view_session_controller(
+        editor_tool=MidiEditorTool.SELECT,
+        notes=notes,
+        snap_resolution="1/16",
+    )
+    qapp.processEvents()
+
+    session.set_selected_note_ids([note.id for note in notes])
+    copied = controller.copy_selected_notes()
+    assert tuple(note.id for note in copied) == ("copy-a", "copy-b")
+
+    pasted = controller.paste_copied_notes()
+    qapp.processEvents()
+
+    assert len(pasted) == 2
+    assert {note.id for note in pasted}.isdisjoint({"copy-a", "copy-b"})
+    assert pasted[0].start_beat == pytest.approx(2.25)
+    assert pasted[0].duration_beats == pytest.approx(0.5)
+    assert pasted[0].channel == 1
+    assert pasted[1].start_beat == pytest.approx(3.25)
+    assert pasted[1].duration_beats == pytest.approx(0.25)
+    assert pasted[1].channel == 3
+    assert session.selected_note_ids == {note.id for note in pasted}
+    assert session.undo_count == 1
+
+    resize_press = _pointer_event_for_note_center(view, pasted[0], modifiers=Qt.KeyboardModifier.AltModifier)
+    resize_target_beat = pasted[0].start_beat + (pasted[0].duration_beats * 0.5) + 0.5
+    resize_move = _pointer_event(
+        view,
+        seconds=float(timeline.beat_to_seconds(resize_target_beat)),
+        pitch=pasted[0].pitch,
+        modifiers=Qt.KeyboardModifier.AltModifier,
+    )
+    controller.handle_pointer_press(resize_press)
+    controller.handle_pointer_move(resize_move)
+    assert view.midi_preview_rect() is not None
+    controller.handle_pointer_release(resize_move)
+    qapp.processEvents()
+
+    resized_a = session.require_note(pasted[0].id)
+    resized_b = session.require_note(pasted[1].id)
+    assert resized_a.start_beat == pytest.approx(2.25)
+    assert resized_a.duration_beats == pytest.approx(1.0)
+    assert resized_b.start_beat == pytest.approx(3.25)
+    assert resized_b.duration_beats == pytest.approx(0.75)
+    assert session.undo_count == 2
+    assert view.midi_preview_rect() is None
+
+    controller.close()
+    view.close()
+
+
+def test_midi_editor_controller_context_menu_supports_copy_and_paste_actions(qapp: QApplication) -> None:
+    note = MidiNote(id="menu-copy", pitch=67, start_beat=2.0, duration_beats=0.5, channel=2)
+    view, session, controller, _timeline = _make_view_session_controller(
+        editor_tool=MidiEditorTool.SELECT,
+        notes=(note,),
+    )
+    qapp.processEvents()
+
+    session.select_note(note.id)
+    menu = controller.build_selection_context_menu(parent=view)
+    assert menu is not None
+    action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
+    assert action_texts == ["复制", "粘贴", "上移半音", "下移半音", "属性…", "删除"]
+
+    copy_action = next(action for action in menu.actions() if action.text() == "复制")
+    paste_action = next(action for action in menu.actions() if action.text() == "粘贴")
+    assert paste_action.isEnabled() is False
+
+    copy_action.trigger()
+    qapp.processEvents()
+
+    menu.deleteLater()
+    menu = controller.build_selection_context_menu(parent=view)
+    assert menu is not None
+    paste_action = next(action for action in menu.actions() if action.text() == "粘贴")
+    assert paste_action.isEnabled() is True
+
+    paste_action.trigger()
+    qapp.processEvents()
+
+    assert len(session.notes) == 2
+    pasted_note = next(candidate for candidate in session.notes if candidate.id != note.id)
+    assert pasted_note.pitch == 67
+    assert pasted_note.start_beat == pytest.approx(2.5)
+    assert pasted_note.duration_beats == pytest.approx(0.5)
+    assert pasted_note.channel == 2
+    assert session.selected_note_ids == {pasted_note.id}
+
+    controller.close()
+    menu.deleteLater()
+    view.close()
+
+
+def test_midi_editor_controller_blank_context_menu_supports_paste_at_clicked_beat(qapp: QApplication) -> None:
+    note = MidiNote(id="blank-copy", pitch=60, start_beat=1.0, duration_beats=0.5, channel=3)
+    view, session, controller, timeline = _make_view_session_controller(
+        editor_tool=MidiEditorTool.SELECT,
+        notes=(note,),
+    )
+    qapp.processEvents()
+
+    target_beat = 3.0
+    blank_menu = controller.build_blank_context_menu(target_beat=target_beat, parent=view)
+    blank_action_texts = [action.text() for action in blank_menu.actions() if not action.isSeparator()]
+    assert blank_action_texts == ["在此粘贴"]
+    paste_action = next(action for action in blank_menu.actions() if action.text() == "在此粘贴")
+    assert paste_action.isEnabled() is False
+    blank_menu.deleteLater()
+
+    session.select_note(note.id)
+    controller.copy_selected_notes()
+
+    blank_request = MidiEditorContextMenuRequest(
+        pointer_event=_pointer_event(
+            view,
+            seconds=float(timeline.beat_to_seconds(target_beat)),
+            pitch=72,
+        ),
+        global_pos=QPoint(12, 12),
+    )
+    controller.handle_context_menu_request(blank_request)
+    qapp.processEvents()
+
+    blank_menu = controller._active_context_menu
+    assert blank_menu is not None
+    assert [action.text() for action in blank_menu.actions() if not action.isSeparator()] == ["在此粘贴"]
+    paste_action = next(action for action in blank_menu.actions() if action.text() == "在此粘贴")
+    assert paste_action.isEnabled() is True
+    paste_action.trigger()
+    qapp.processEvents()
+
+    pasted_note = next(candidate for candidate in session.notes if candidate.id != note.id)
+    assert pasted_note.start_beat == pytest.approx(target_beat)
+    assert pasted_note.duration_beats == pytest.approx(0.5)
+    assert pasted_note.pitch == 60
+    assert pasted_note.channel == 3
+    assert session.selected_note_ids == {pasted_note.id}
+
+    controller.close()
+    view.close()
+
+
 def test_midi_editor_controller_erase_tool_and_context_menu_actions_work(
     qapp: QApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -179,7 +328,7 @@ def test_midi_editor_controller_erase_tool_and_context_menu_actions_work(
     menu = controller.build_selection_context_menu(parent=view)
     assert menu is not None
     action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
-    assert action_texts == ["上移半音", "下移半音", "属性…", "删除"]
+    assert action_texts == ["复制", "粘贴", "上移半音", "下移半音", "属性…", "删除"]
 
     next(action for action in menu.actions() if action.text() == "上移半音").trigger()
     qapp.processEvents()
