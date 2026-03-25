@@ -278,6 +278,41 @@ def test_main_window_restores_editor_and_mix_settings_from_qsettings(monkeypatch
     window.close()
 
 
+def test_main_window_toolbar_groups_project_and_history_view_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+) -> None:
+    settings_store: dict[str, object] = {}
+    _patch_main_window_environment(monkeypatch, settings_store)
+
+    window = SpectracerMainWindow()
+    window.show()
+    qapp.processEvents()
+
+    assert window.project_toolbar_button.text() == "项目"
+    assert window.history_view_toolbar_button.text() == "历史/视图"
+
+    assert window.main_toolbar.widgetForAction(window.open_action) is None
+    assert window.main_toolbar.widgetForAction(window.export_midi_action) is None
+    assert window.main_toolbar.widgetForAction(window.undo_action) is None
+    assert window.main_toolbar.widgetForAction(window.redo_action) is None
+    assert window.main_toolbar.widgetForAction(window.zoom_reset_action) is None
+    assert window.main_toolbar.widgetForAction(window.zoom_x_in_action) is None
+    assert window.main_toolbar.widgetForAction(window.zoom_x_out_action) is None
+    assert window.main_toolbar.widgetForAction(window.zoom_y_in_action) is None
+    assert window.main_toolbar.widgetForAction(window.zoom_y_out_action) is None
+
+    project_menu = window.project_toolbar_button.menu()
+    assert project_menu is not None
+    assert [action.text() for action in project_menu.actions() if not action.isSeparator()] == ["打开音频", "导出 MIDI..."]
+
+    history_view_menu = window.history_view_toolbar_button.menu()
+    assert history_view_menu is not None
+    assert [action.text() for action in history_view_menu.actions() if not action.isSeparator()] == ["撤销", "重做", "重置视图", "横向放大", "横向缩小", "纵向放大", "纵向缩小"]
+
+    window.close()
+
+
 def test_main_window_editor_shortcuts_and_session_signals_keep_controls_in_sync(
     monkeypatch: pytest.MonkeyPatch,
     qapp: QApplication,

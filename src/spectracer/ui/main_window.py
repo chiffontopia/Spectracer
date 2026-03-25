@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -380,8 +382,6 @@ class SpectracerMainWindow(QMainWindow):
         self.addToolBar(self.main_toolbar)
 
         self.open_action = QAction("打开音频", self)
-        self.main_toolbar.addAction(self.open_action)
-        self.main_toolbar.addSeparator()
 
         self.undo_action = QAction("撤销", self)
         self.undo_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Undo))
@@ -391,9 +391,6 @@ class SpectracerMainWindow(QMainWindow):
         if shift_redo_shortcut not in redo_shortcuts:
             redo_shortcuts.append(shift_redo_shortcut)
         self.redo_action.setShortcuts(redo_shortcuts)
-        self.main_toolbar.addAction(self.undo_action)
-        self.main_toolbar.addAction(self.redo_action)
-        self.main_toolbar.addSeparator()
 
         self.zoom_reset_action = QAction("重置视图", self)
         self.zoom_x_in_action = QAction("横向放大", self)
@@ -404,11 +401,39 @@ class SpectracerMainWindow(QMainWindow):
         self.follow_cursor_action.setCheckable(True)
         self.follow_cursor_action.setChecked(self._follow_cursor_enabled)
         self.locate_cursor_action = QAction("定位游标", self)
-        self.main_toolbar.addAction(self.zoom_reset_action)
-        self.main_toolbar.addAction(self.zoom_x_in_action)
-        self.main_toolbar.addAction(self.zoom_x_out_action)
-        self.main_toolbar.addAction(self.zoom_y_in_action)
-        self.main_toolbar.addAction(self.zoom_y_out_action)
+
+        self.colormap_action = QAction("色盘...", self)
+        self.export_midi_action = QAction("导出 MIDI...", self)
+        self.midi_settings_action = QAction("MIDI...", self)
+        self.grid_settings_action = QAction("网格...", self)
+        self.grid_toggle_action = QAction("显示网格", self)
+        self.grid_toggle_action.setCheckable(True)
+        self.grid_toggle_action.setChecked(self._grid_settings.visible)
+        self.event_track_toggle_action = QAction("事件轨道", self)
+        self.event_track_toggle_action.setCheckable(True)
+        self.event_track_toggle_action.setChecked(self._grid_settings.event_track_visible)
+
+        self.project_toolbar_button = self._create_toolbar_menu_button(
+            text="项目",
+            tooltip="项目相关操作。",
+            actions=(self.open_action, self.export_midi_action),
+        )
+        self.history_view_toolbar_button = self._create_toolbar_menu_button(
+            text="历史/视图",
+            tooltip="撤销、重做与视图缩放操作。",
+            actions=(
+                self.undo_action,
+                self.redo_action,
+                None,
+                self.zoom_reset_action,
+                self.zoom_x_in_action,
+                self.zoom_x_out_action,
+                self.zoom_y_in_action,
+                self.zoom_y_out_action,
+            ),
+        )
+        self.main_toolbar.addWidget(self.project_toolbar_button)
+        self.main_toolbar.addWidget(self.history_view_toolbar_button)
         self.main_toolbar.addSeparator()
         self.main_toolbar.addAction(self.follow_cursor_action)
         self.main_toolbar.addAction(self.locate_cursor_action)
@@ -423,21 +448,9 @@ class SpectracerMainWindow(QMainWindow):
             max(0, self.normalization_combo.findData(self._normalization_mode.value))
         )
 
-        self.colormap_action = QAction("色盘...", self)
-        self.export_midi_action = QAction("导出 MIDI...", self)
-        self.midi_settings_action = QAction("MIDI...", self)
-        self.grid_settings_action = QAction("网格...", self)
-        self.grid_toggle_action = QAction("显示网格", self)
-        self.grid_toggle_action.setCheckable(True)
-        self.grid_toggle_action.setChecked(self._grid_settings.visible)
-        self.event_track_toggle_action = QAction("事件轨道", self)
-        self.event_track_toggle_action.setCheckable(True)
-        self.event_track_toggle_action.setChecked(self._grid_settings.event_track_visible)
-
         self.main_toolbar.addWidget(self.normalization_toolbar_label)
         self.main_toolbar.addWidget(self.normalization_combo)
         self.main_toolbar.addAction(self.colormap_action)
-        self.main_toolbar.addAction(self.export_midi_action)
         self.main_toolbar.addAction(self.midi_settings_action)
         self.main_toolbar.addAction(self.grid_settings_action)
         self.main_toolbar.addAction(self.grid_toggle_action)
@@ -665,6 +678,28 @@ class SpectracerMainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.midi_status_label)
 
         self._sync_undo_redo_actions()
+
+    def _create_toolbar_menu_button(
+        self,
+        *,
+        text: str,
+        tooltip: str,
+        actions: Sequence[QAction | None],
+    ) -> QToolButton:
+        button = QToolButton(self.main_toolbar)
+        button.setText(text)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setAutoRaise(True)
+        button.setToolTip(tooltip)
+        menu = QMenu(button)
+        for action in actions:
+            if action is None:
+                menu.addSeparator()
+                continue
+            menu.addAction(action)
+        button.setMenu(menu)
+        return button
 
     def _connect_signals(self) -> None:
         self.open_action.triggered.connect(self.open_audio_dialog)
