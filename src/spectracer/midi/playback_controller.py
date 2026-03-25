@@ -60,6 +60,7 @@ class MidiPlaybackController(QObject):
         self._playback_engine.playback_state_changed.connect(self._on_playback_state_changed)
         self._playback_engine.playback_rate_changed.connect(self._on_playback_rate_changed)
         self._playback_engine.media_loaded.connect(self._on_media_loaded)
+        self._attach_session_signals(self._session)
 
         self.refresh_schedule()
         self.apply_channel_configs()
@@ -103,10 +104,14 @@ class MidiPlaybackController(QObject):
             self._poll_timer.start()
 
     def set_session(self, session: MidiSession) -> None:
+        if session is self._session:
+            return
+        self._detach_session_signals(self._session)
         self._session = session
+        self._attach_session_signals(self._session)
         self.refresh_schedule()
         self.apply_channel_configs()
-        self.sync_to_playback_position(current_seconds=self._playback_engine.state.position_seconds)
+        self._resync_to_current_position()
 
     def set_timeline(self, timeline: MidiGridTimeline) -> None:
         self._timeline = timeline
@@ -317,6 +322,32 @@ class MidiPlaybackController(QObject):
         for scheduled in list(self._active_notes.values()):
             self._send_note_off(scheduled)
         self._active_notes.clear()
+
+    def _attach_session_signals(self, session: MidiSession) -> None:
+        session.notes_changed.connect(self._on_session_notes_changed)
+        session.channel_configs_changed.connect(self._on_session_channel_configs_changed)
+
+    def _detach_session_signals(self, session: MidiSession) -> None:
+        for signal, slot in (
+            (session.notes_changed, self._on_session_notes_changed),
+            (session.channel_configs_changed, self._on_session_channel_configs_changed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                continue
+
+    def _on_session_notes_changed(self, _notes: object) -> None:
+        self.refresh_schedule()
+        self._resync_to_current_position()
+
+    def _on_session_channel_configs_changed(self, _channel_configs: object) -> None:
+        self.apply_channel_configs()
+        self._resync_to_current_position()
+
+    def _resync_to_current_position(self) -> None:
+        self._last_processed_seconds = None
+        self.sync_to_playback_position(current_seconds=self._playback_engine.state.position_seconds)
 
 
 __all__ = ["MidiPlaybackController", "ScheduledMidiNote"]

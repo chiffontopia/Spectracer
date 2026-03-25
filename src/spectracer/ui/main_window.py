@@ -10,6 +10,7 @@ from PyQt6.QtCore import QObject, QSettings, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -36,11 +37,13 @@ from spectracer.app.analysis_workflow import (
     MultiChannelAnalysisResult,
     execute_multi_channel_analysis,
 )
+from spectracer.app.controllers.midi_editor_controller import MidiEditorController
 from spectracer.audio.playback import PlaybackEngine
 from spectracer.core.config import AnalyzeCliConfig, load_runtime_analyze_config
 from spectracer.core.models import AnalysisParams, ChannelMode
 from spectracer.core.pitch import frequency_to_midi
-from spectracer.midi.editor_model import EventTrackLane, EventTrackSelection
+from spectracer.midi.editor_model import EventTrackLane, EventTrackSelection, MidiEditorState, MidiEditorTool, MidiSnapResolution
+from spectracer.midi.exporter import export_notes_to_midi
 from spectracer.midi.gm import gm_program_name, is_drum_channel
 from spectracer.midi.grid import (
     GridDivision,
@@ -52,10 +55,11 @@ from spectracer.midi.grid import (
 )
 from spectracer.midi.playback_controller import MidiPlaybackController
 from spectracer.midi.session import MidiSession
-from spectracer.midi.synth import MidiSynth, create_default_midi_synth
+from spectracer.midi.synth import DEFAULT_GAIN, MidiSynth, create_default_midi_synth
 from spectracer.dsp.colormap import ColorStop, default_spectracer_colormap_stops, normalize_colormap_stops
 from spectracer.dsp.visualization import NormalizationMode
 from spectracer.ui.dialogs.analysis_options_dialog import AnalysisOptionsDialog
+from spectracer.ui.dialogs.channel_config_dialog import ChannelConfigDialog
 from spectracer.ui.dialogs.grid_event_dialog import TempoEventDialog, TimeSignatureEventDialog
 from spectracer.ui.dialogs.grid_settings_dialog import GridSettingsDialog
 from spectracer.ui.overlays.event_track_widget import EventTrackLaneLabels, GridEventTrackWidget
@@ -74,6 +78,7 @@ PLAYBACK_RATE_SLIDER_DEFAULT = 100  # 1.00x
 MIDI_AUDITION_DURATION_MS = 360
 MIDI_AUDITION_RETRIGGER_GAP_MS = 0
 MIDI_AUDITION_VELOCITY = 108
+FRACTION_SLIDER_RANGE = 100
 
 
 def _default_grid_tempo_events() -> tuple[TempoEvent, ...]:
@@ -307,6 +312,9 @@ class SpectracerMainWindow(QMainWindow):
         self._colormap_stops: list[ColorStop] = self._load_colormap_stops()
         self._midi_settings = self._load_midi_user_settings()
         self._grid_settings = self._load_grid_user_settings()
+        self._midi_editor_state = self._load_midi_editor_state()
+        self._background_mix_gain = self._read_float_setting("mixer/background_gain", 0.85, minimum=0.0, maximum=1.0)
+        self._midi_mix_gain = self._read_float_setting("mixer/midi_gain", DEFAULT_GAIN, minimum=0.0, maximum=1.0)
         self._grid_timeline = self._build_grid_timeline(self._grid_settings)
 
         self._suppress_view_state_persist = False
@@ -334,6 +342,17 @@ class SpectracerMainWindow(QMainWindow):
         self._sync_midi_backend_status()
 
         self._build_ui()
+        self.spectrogram_view.set_midi_session(self._midi_session)
+        self._midi_editor_controller = MidiEditorController(
+            self.spectrogram_view,
+            session=self._midi_session,
+            timeline=self._grid_timeline,
+            menu_host=self,
+            parent=self,
+        )
+        self._apply_midi_editor_state(self._midi_editor_state, persist=False)
+        self._set_background_mix_gain(self._background_mix_gain, persist=False)
+        self._set_midi_mix_gain(self._midi_mix_gain, persist=False)
         self._update_midi_status_display()
         self._apply_event_track_visibility()
         self._connect_signals()
@@ -362,6 +381,18 @@ class SpectracerMainWindow(QMainWindow):
 
         self.open_action = QAction("打开音频", self)
         self.main_toolbar.addAction(self.open_action)
+        self.main_toolbar.addSeparator()
+
+        self.undo_action = QAction("撤销", self)
+        self.undo_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Undo))
+        self.redo_action = QAction("重做", self)
+        redo_shortcuts = list(QKeySequence.keyBindings(QKeySequence.StandardKey.Redo))
+        shift_redo_shortcut = QKeySequence("Ctrl+Shift+Z")
+        if shift_redo_shortcut not in redo_shortcuts:
+            redo_shortcuts.append(shift_redo_shortcut)
+        self.redo_action.setShortcuts(redo_shortcuts)
+        self.main_toolbar.addAction(self.undo_action)
+        self.main_toolbar.addAction(self.redo_action)
         self.main_toolbar.addSeparator()
 
         self.zoom_reset_action = QAction("重置视图", self)
@@ -393,6 +424,7 @@ class SpectracerMainWindow(QMainWindow):
         )
 
         self.colormap_action = QAction("色盘...", self)
+        self.export_midi_action = QAction("导出 MIDI...", self)
         self.midi_settings_action = QAction("MIDI...", self)
         self.grid_settings_action = QAction("网格...", self)
         self.grid_toggle_action = QAction("显示网格", self)
@@ -405,6 +437,7 @@ class SpectracerMainWindow(QMainWindow):
         self.main_toolbar.addWidget(self.normalization_toolbar_label)
         self.main_toolbar.addWidget(self.normalization_combo)
         self.main_toolbar.addAction(self.colormap_action)
+        self.main_toolbar.addAction(self.export_midi_action)
         self.main_toolbar.addAction(self.midi_settings_action)
         self.main_toolbar.addAction(self.grid_settings_action)
         self.main_toolbar.addAction(self.grid_toggle_action)
@@ -434,6 +467,13 @@ class SpectracerMainWindow(QMainWindow):
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.space_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
 
+        self.place_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_E), self)
+        self.place_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.select_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_S), self)
+        self.select_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.erase_tool_shortcut = QShortcut(QKeySequence(Qt.Key.Key_D), self)
+        self.erase_tool_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+
         self.central = QWidget(self)
         self.setCentralWidget(self.central)
 
@@ -462,6 +502,76 @@ class SpectracerMainWindow(QMainWindow):
         top_info_layout.addWidget(self.harmonics_checkbox)
         top_info_layout.addWidget(self.harmonics_count_spinbox)
         root_layout.addLayout(top_info_layout)
+
+        self.editor_controls_row = QWidget(self)
+        editor_controls_layout = QHBoxLayout(self.editor_controls_row)
+        editor_controls_layout.setContentsMargins(0, 0, 0, 0)
+        editor_controls_layout.setSpacing(8)
+        self.edit_mode_checkbox = QCheckBox("编辑模式")
+        self.edit_mode_checkbox.setToolTip("开启后显示 MIDI 覆盖层，并按设定暗化背景热图。")
+        self.editor_tool_label = QLabel("工具")
+        self.editor_tool_group = QButtonGroup(self)
+        self.editor_tool_group.setExclusive(True)
+
+        self.place_tool_button = QPushButton("放置")
+        self.select_tool_button = QPushButton("选择")
+        self.erase_tool_button = QPushButton("擦除")
+        self.place_tool_button.setToolTip("放置工具 (E)")
+        self.select_tool_button.setToolTip("选择工具 (S)")
+        self.erase_tool_button.setToolTip("擦除工具 (D)")
+        editor_controls_layout.addWidget(self.edit_mode_checkbox)
+        editor_controls_layout.addWidget(self.editor_tool_label)
+        for button, tool in (
+            (self.place_tool_button, MidiEditorTool.PLACE),
+            (self.select_tool_button, MidiEditorTool.SELECT),
+            (self.erase_tool_button, MidiEditorTool.ERASE),
+        ):
+            button.setCheckable(True)
+            button.setProperty("midiTool", tool.value)
+            self.editor_tool_group.addButton(button)
+            editor_controls_layout.addWidget(button)
+        self.editor_snap_checkbox = QCheckBox("吸附")
+        self.editor_snap_resolution_combo = QComboBox(self)
+        self.editor_snap_resolution_combo.setMinimumWidth(84)
+        for resolution in MidiSnapResolution.ordered():
+            self.editor_snap_resolution_combo.addItem(resolution.display_name, resolution.value)
+        self.editor_active_channel_label = QLabel("通道")
+        self.editor_active_channel_combo = QComboBox(self)
+        self.editor_active_channel_combo.setMinimumWidth(180)
+        self.channel_config_button = QPushButton("配置…")
+        self.channel_config_button.setToolTip("编辑当前通道的名称、音色、声像、颜色与静音/独奏状态。")
+        self.editor_darken_label = QLabel("暗化")
+        self.editor_darken_slider = QSlider(Qt.Orientation.Horizontal)
+        self.editor_darken_slider.setRange(0, FRACTION_SLIDER_RANGE)
+        self.editor_darken_slider.setFixedWidth(110)
+        self.editor_darken_value_label = QLabel("35%")
+        self.background_mix_label = QLabel("BG")
+        self.background_mix_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_mix_slider.setRange(0, FRACTION_SLIDER_RANGE)
+        self.background_mix_slider.setFixedWidth(96)
+        self.background_mix_value_label = QLabel("85%")
+        self.midi_mix_label = QLabel("MIDI")
+        self.midi_mix_slider = QSlider(Qt.Orientation.Horizontal)
+        self.midi_mix_slider.setRange(0, FRACTION_SLIDER_RANGE)
+        self.midi_mix_slider.setFixedWidth(96)
+        self.midi_mix_value_label = QLabel("60%")
+        editor_controls_layout.addWidget(self.editor_snap_checkbox)
+        editor_controls_layout.addWidget(self.editor_snap_resolution_combo)
+        editor_controls_layout.addWidget(self.editor_active_channel_label)
+        editor_controls_layout.addWidget(self.editor_active_channel_combo)
+        editor_controls_layout.addWidget(self.channel_config_button)
+        editor_controls_layout.addWidget(self.editor_darken_label)
+        editor_controls_layout.addWidget(self.editor_darken_slider)
+        editor_controls_layout.addWidget(self.editor_darken_value_label)
+        editor_controls_layout.addStretch(1)
+        editor_controls_layout.addWidget(self.background_mix_label)
+        editor_controls_layout.addWidget(self.background_mix_slider)
+        editor_controls_layout.addWidget(self.background_mix_value_label)
+        editor_controls_layout.addWidget(self.midi_mix_label)
+        editor_controls_layout.addWidget(self.midi_mix_slider)
+        editor_controls_layout.addWidget(self.midi_mix_value_label)
+        root_layout.addWidget(self.editor_controls_row)
+        self._populate_editor_active_channel_combo()
 
         self.view_grid = QGridLayout()
         self.view_grid.setContentsMargins(0, 0, 0, 0)
@@ -548,11 +658,18 @@ class SpectracerMainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_message, 1)
         self.statusBar().addPermanentWidget(self.midi_status_label)
 
+        self._sync_undo_redo_actions()
+
     def _connect_signals(self) -> None:
         self.open_action.triggered.connect(self.open_audio_dialog)
+        self.undo_action.triggered.connect(self._undo_last_midi_edit)
+        self.redo_action.triggered.connect(self._redo_last_midi_edit)
         self.open_button.clicked.connect(self.open_audio_dialog)
         self.play_button.clicked.connect(self.toggle_playback)
         self.space_shortcut.activated.connect(self.toggle_playback)
+        self.place_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.PLACE, persist=True))
+        self.select_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.SELECT, persist=True))
+        self.erase_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.ERASE, persist=True))
 
         self.playback_rate_slider.valueChanged.connect(self._on_playback_rate_slider_changed)
         self.playback_rate_reset_button.clicked.connect(self._reset_playback_rate)
@@ -568,11 +685,21 @@ class SpectracerMainWindow(QMainWindow):
 
         self.normalization_combo.currentIndexChanged.connect(self._on_normalization_mode_changed)
         self.colormap_action.triggered.connect(self._open_colormap_editor)
+        self.export_midi_action.triggered.connect(self._open_export_midi_dialog)
         self.midi_settings_action.triggered.connect(self._open_midi_settings_dialog)
         self.grid_settings_action.triggered.connect(self._open_grid_settings_dialog)
         self.grid_toggle_action.toggled.connect(self._on_grid_visibility_toggled)
         self.event_track_toggle_action.toggled.connect(self._on_event_track_visibility_toggled)
         self.event_snap_checkbox.toggled.connect(self._on_event_snap_toggled)
+        self.edit_mode_checkbox.toggled.connect(self._on_edit_mode_toggled)
+        self.editor_tool_group.buttonClicked.connect(self._on_editor_tool_button_clicked)
+        self.editor_snap_checkbox.toggled.connect(self._on_editor_snap_toggled)
+        self.editor_snap_resolution_combo.currentIndexChanged.connect(self._on_editor_snap_resolution_changed)
+        self.editor_active_channel_combo.currentIndexChanged.connect(self._on_editor_active_channel_changed)
+        self.channel_config_button.clicked.connect(self._open_active_channel_config_dialog)
+        self.editor_darken_slider.valueChanged.connect(self._on_editor_darken_slider_changed)
+        self.background_mix_slider.valueChanged.connect(self._on_background_mix_slider_changed)
+        self.midi_mix_slider.valueChanged.connect(self._on_midi_mix_slider_changed)
         self.reset_events_button.clicked.connect(self._on_reset_events_requested)
         self.event_track_view.create_requested.connect(self._on_event_track_create_requested)
         self.event_track_view.move_requested.connect(self._on_event_track_move_requested)
@@ -602,6 +729,10 @@ class SpectracerMainWindow(QMainWindow):
 
         self.horizontal_scrollbar.valueChanged.connect(self._on_horizontal_scrollbar_changed)
         self.vertical_scrollbar.valueChanged.connect(self._on_vertical_scrollbar_changed)
+
+        self._midi_session.editor_state_changed.connect(self._on_midi_session_editor_state_changed)
+        self._midi_session.channel_configs_changed.connect(self._on_midi_session_channel_configs_changed)
+        self._midi_session.command_stack_changed.connect(self._on_midi_session_command_stack_changed)
 
     def open_audio_dialog(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -693,6 +824,35 @@ class SpectracerMainWindow(QMainWindow):
         self._save_colormap_stops(self._colormap_stops)
         self.status_message.setText("已更新热图色盘")
 
+    def _open_export_midi_dialog(self) -> None:
+        suggested_path = self._suggest_midi_export_path()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 MIDI",
+            str(suggested_path),
+            "MIDI Files (*.mid);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            exported_path = export_notes_to_midi(
+                file_path,
+                notes=self._midi_session.notes,
+                channel_configs=self._midi_session.channel_configs,
+                timeline=self._grid_timeline,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._show_error(f"MIDI 导出失败：{exc}")
+            return
+
+        self.status_message.setText(f"已导出 MIDI：{exported_path}")
+
+    def _suggest_midi_export_path(self) -> Path:
+        if self._current_audio_path is not None:
+            return Path(self._current_audio_path).with_suffix(".mid")
+        return Path.cwd() / "spectracer_export.mid"
+
     def _open_midi_settings_dialog(self) -> None:
         dialog = MidiSettingsDialog(
             initial_output_name=self._midi_settings.output_name,
@@ -736,6 +896,157 @@ class SpectracerMainWindow(QMainWindow):
         self._settings.setValue("midi/soundfont_path", settings.soundfont_path or "")
         self._settings.setValue("midi/program", int(settings.program))
         self._settings.setValue("midi/channel", int(settings.channel))
+
+    def _load_midi_editor_state(self) -> MidiEditorState:
+        return MidiEditorState(
+            enabled=self._read_bool_setting("midi_editor/enabled", False),
+            tool=self._settings.value("midi_editor/tool", MidiEditorTool.SELECT.value),
+            active_channel=self._read_int_setting("midi_editor/active_channel", 0, minimum=0, maximum=15),
+            snap_enabled=self._read_bool_setting("midi_editor/snap_enabled", True),
+            snap_resolution=self._settings.value("midi_editor/snap_resolution", MidiSnapResolution.SIXTEENTH.value),
+            darken_amount=self._read_float_setting("midi_editor/darken_amount", 0.35, minimum=0.0, maximum=1.0),
+        )
+
+    def _save_midi_editor_state(self, editor_state: MidiEditorState) -> None:
+        self._settings.setValue("midi_editor/enabled", bool(editor_state.enabled))
+        self._settings.setValue("midi_editor/tool", editor_state.tool.value)
+        self._settings.setValue("midi_editor/active_channel", int(editor_state.active_channel))
+        self._settings.setValue("midi_editor/snap_enabled", bool(editor_state.snap_enabled))
+        self._settings.setValue("midi_editor/snap_resolution", editor_state.snap_resolution.value)
+        self._settings.setValue("midi_editor/darken_amount", float(editor_state.darken_amount))
+
+    def _populate_editor_active_channel_combo(self) -> None:
+        if not hasattr(self, "editor_active_channel_combo"):
+            return
+        current_channel = self._midi_session.editor_state.active_channel
+        self.editor_active_channel_combo.blockSignals(True)
+        self.editor_active_channel_combo.clear()
+        for config in self._midi_session.channel_configs:
+            tags: list[str] = []
+            if config.is_drum:
+                tags.append("打击乐")
+            if config.solo:
+                tags.append("独奏")
+            if config.muted:
+                tags.append("静音")
+            suffix = f"（{' / '.join(tags)}）" if tags else ""
+            label = f"{config.channel + 1:02d} · {config.display_name}{suffix}"
+            self.editor_active_channel_combo.addItem(label, config.channel)
+        index = max(0, self.editor_active_channel_combo.findData(current_channel))
+        self.editor_active_channel_combo.setCurrentIndex(index)
+        self.editor_active_channel_combo.blockSignals(False)
+
+    def _open_active_channel_config_dialog(self) -> None:
+        combo_data = self.editor_active_channel_combo.currentData()
+        active_channel = self._midi_session.editor_state.active_channel if combo_data is None else int(combo_data)
+        dialog_result = ChannelConfigDialog.get_config(
+            initial_config=self._midi_session.get_channel_config(active_channel),
+            parent=self,
+        )
+        if dialog_result is None:
+            return
+        updated_config = self._midi_session.set_channel_config(dialog_result)
+        program_text = self._format_midi_program_text(updated_config.program, updated_config.channel)
+        state_tags = []
+        if updated_config.solo:
+            state_tags.append("独奏")
+        if updated_config.muted:
+            state_tags.append("静音")
+        state_text = " | " + " / ".join(state_tags) if state_tags else ""
+        self.status_message.setText(
+            f"已更新通道 {updated_config.channel + 1:02d}：{updated_config.display_name} | {program_text} | Pan {updated_config.pan}{state_text}"
+        )
+
+    def _apply_midi_editor_state(self, editor_state: MidiEditorState, *, persist: bool) -> None:
+        self._midi_editor_state = self._midi_session.set_editor_state(editor_state)
+        self.spectrogram_view.set_midi_editor_state(self._midi_editor_state)
+        self._sync_midi_editor_controls()
+        if persist:
+            self._save_midi_editor_state(self._midi_editor_state)
+
+    def _on_midi_session_editor_state_changed(self, editor_state: object) -> None:
+        if not isinstance(editor_state, MidiEditorState):
+            return
+        self._midi_editor_state = editor_state
+        self._sync_midi_editor_controls()
+
+    def _on_midi_session_channel_configs_changed(self, _channel_configs: object) -> None:
+        self._populate_editor_active_channel_combo()
+
+    def _on_midi_session_command_stack_changed(self, _state: object) -> None:
+        self._sync_undo_redo_actions()
+
+    def _undo_last_midi_edit(self) -> None:
+        command = self._midi_session.undo()
+        if command is None:
+            return
+        self.status_message.setText(f"已撤销：{command.summary}")
+
+    def _redo_last_midi_edit(self) -> None:
+        command = self._midi_session.redo()
+        if command is None:
+            return
+        self.status_message.setText(f"已重做：{command.summary}")
+
+    def _sync_undo_redo_actions(self) -> None:
+        state = self._midi_session.command_stack_state
+        self.undo_action.setEnabled(state.can_undo)
+        self.undo_action.setToolTip(f"撤销：{state.undo_text}" if state.undo_text else "撤销")
+        self.redo_action.setEnabled(state.can_redo)
+        self.redo_action.setToolTip(f"重做：{state.redo_text}" if state.redo_text else "重做")
+
+    def _sync_midi_editor_controls(self) -> None:
+        state = self._midi_session.editor_state
+        self._populate_editor_active_channel_combo()
+        self.edit_mode_checkbox.blockSignals(True)
+        self.edit_mode_checkbox.setChecked(state.enabled)
+        self.edit_mode_checkbox.blockSignals(False)
+        for button, tool in (
+            (self.place_tool_button, MidiEditorTool.PLACE),
+            (self.select_tool_button, MidiEditorTool.SELECT),
+            (self.erase_tool_button, MidiEditorTool.ERASE),
+        ):
+            button.blockSignals(True)
+            button.setChecked(state.tool is tool)
+            button.blockSignals(False)
+        self.editor_snap_checkbox.blockSignals(True)
+        self.editor_snap_checkbox.setChecked(state.snap_enabled)
+        self.editor_snap_checkbox.blockSignals(False)
+        snap_index = max(0, self.editor_snap_resolution_combo.findData(state.snap_resolution.value))
+        self.editor_snap_resolution_combo.blockSignals(True)
+        self.editor_snap_resolution_combo.setCurrentIndex(snap_index)
+        self.editor_snap_resolution_combo.blockSignals(False)
+        self.editor_snap_resolution_combo.setEnabled(state.snap_enabled)
+        channel_index = max(0, self.editor_active_channel_combo.findData(state.active_channel))
+        self.editor_active_channel_combo.blockSignals(True)
+        self.editor_active_channel_combo.setCurrentIndex(channel_index)
+        self.editor_active_channel_combo.blockSignals(False)
+        self.editor_darken_slider.blockSignals(True)
+        self.editor_darken_slider.setValue(self._fraction_to_slider_value(state.darken_amount))
+        self.editor_darken_slider.blockSignals(False)
+        self.editor_darken_value_label.setText(self._format_percent_label(state.darken_amount))
+
+    def _set_background_mix_gain(self, value: float, *, persist: bool) -> None:
+        self.playback_engine.set_volume(max(0.0, min(1.0, float(value))))
+        self._sync_mix_controls()
+        if persist:
+            self._settings.setValue("mixer/background_gain", float(self.playback_engine.state.volume))
+
+    def _set_midi_mix_gain(self, value: float, *, persist: bool) -> None:
+        self._midi_playback_controller.set_midi_gain(max(0.0, min(1.0, float(value))))
+        self._sync_mix_controls()
+        if persist:
+            self._settings.setValue("mixer/midi_gain", float(self._midi_playback_controller.midi_gain))
+
+    def _sync_mix_controls(self) -> None:
+        self.background_mix_slider.blockSignals(True)
+        self.background_mix_slider.setValue(self._fraction_to_slider_value(self.playback_engine.state.volume))
+        self.background_mix_slider.blockSignals(False)
+        self.background_mix_value_label.setText(self._format_percent_label(self.playback_engine.state.volume))
+        self.midi_mix_slider.blockSignals(True)
+        self.midi_mix_slider.setValue(self._fraction_to_slider_value(self._midi_playback_controller.midi_gain))
+        self.midi_mix_slider.blockSignals(False)
+        self.midi_mix_value_label.setText(self._format_percent_label(self._midi_playback_controller.midi_gain))
 
     def _open_grid_settings_dialog(self) -> None:
         dialog = GridSettingsDialog(
@@ -1101,6 +1412,7 @@ class SpectracerMainWindow(QMainWindow):
         self.spectrogram_view.set_grid_division(GridDivision(self._grid_settings.subdivisions_per_beat))
         self.spectrogram_view.set_grid_visible(self._grid_settings.visible)
         self._midi_playback_controller.set_timeline(self._grid_timeline)
+        self._midi_editor_controller.set_timeline(self._grid_timeline)
         self.event_snap_checkbox.blockSignals(True)
         self.event_snap_checkbox.setChecked(self._grid_settings.event_snap_enabled)
         self.event_snap_checkbox.blockSignals(False)
@@ -1814,12 +2126,92 @@ class SpectracerMainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
+        self._midi_editor_controller.close()
         self._midi_playback_controller.close()
         self.midi_synth.close()
         super().closeEvent(event)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Spectracer", message)
+
+    def _read_bool_setting(self, key: str, default: bool) -> bool:
+        raw_value = self._settings.value(key, default)
+        if isinstance(raw_value, bool):
+            return raw_value
+        return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _read_float_setting(
+        self,
+        key: str,
+        default: float,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float:
+        try:
+            value = float(self._settings.value(key, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        if minimum is not None:
+            value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
+        return value
+
+    def _read_int_setting(self, key: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+        try:
+            value = int(self._settings.value(key, default))
+        except (TypeError, ValueError):
+            value = int(default)
+        if minimum is not None:
+            value = max(int(minimum), value)
+        if maximum is not None:
+            value = min(int(maximum), value)
+        return value
+
+    def _fraction_to_slider_value(self, value: float) -> int:
+        clamped = max(0.0, min(1.0, float(value)))
+        return int(round(clamped * FRACTION_SLIDER_RANGE))
+
+    def _slider_value_to_fraction(self, value: int) -> float:
+        return max(0.0, min(1.0, float(value) / FRACTION_SLIDER_RANGE))
+
+    def _format_percent_label(self, value: float) -> str:
+        return f"{int(round(max(0.0, min(1.0, float(value))) * 100.0))}%"
+
+    def _on_edit_mode_toggled(self, enabled: bool) -> None:
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(enabled=enabled), persist=True)
+
+    def _set_editor_tool(self, tool: MidiEditorTool, *, persist: bool) -> None:
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(tool=tool), persist=persist)
+
+    def _on_editor_tool_button_clicked(self, button) -> None:
+        tool = MidiEditorTool.parse(button.property("midiTool"))
+        self._set_editor_tool(tool, persist=True)
+
+    def _on_editor_snap_toggled(self, enabled: bool) -> None:
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(snap_enabled=enabled), persist=True)
+
+    def _on_editor_snap_resolution_changed(self, index: int) -> None:
+        data = self.editor_snap_resolution_combo.itemData(index)
+        if data is None:
+            return
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(snap_resolution=data), persist=True)
+
+    def _on_editor_active_channel_changed(self, index: int) -> None:
+        data = self.editor_active_channel_combo.itemData(index)
+        if data is None:
+            return
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(active_channel=int(data)), persist=True)
+
+    def _on_editor_darken_slider_changed(self, value: int) -> None:
+        self._apply_midi_editor_state(self._midi_session.editor_state.with_updates(darken_amount=self._slider_value_to_fraction(value)), persist=True)
+
+    def _on_background_mix_slider_changed(self, value: int) -> None:
+        self._set_background_mix_gain(self._slider_value_to_fraction(value), persist=True)
+
+    def _on_midi_mix_slider_changed(self, value: int) -> None:
+        self._set_midi_mix_gain(self._slider_value_to_fraction(value), persist=True)
 
     def _slider_to_display_value(self, value: int) -> float:
         return max(0.1, min(4.0, float(value) / 100.0))

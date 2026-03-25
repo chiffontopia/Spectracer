@@ -6,16 +6,19 @@ from typing import Sequence
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QPainterPath, QPen
 from PyQt6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsSimpleTextItem
 
 from spectracer.core.harmonics import bin_index_from_plot_y, harmonic_bin_indices
 from spectracer.core.models import CqtResult
-from spectracer.core.pitch import frequency_to_note_name
+from spectracer.core.pitch import frequency_to_midi, frequency_to_note_name
+from spectracer.midi.editor_model import MidiEditorState, MidiNote
 from spectracer.dsp.colormap import ColorStop, default_spectracer_colormap_stops, make_linear_colormap
 from spectracer.dsp.visualization import NormalizationMode, normalize_cqt_for_display
 from spectracer.midi.grid import GridDivision, GridLine, GridLineKind, MidiGridTimeline
+from spectracer.midi.session import MidiSession
+from spectracer.ui.overlays.midi_note_overlay import MidiNoteOverlay
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
@@ -39,6 +42,20 @@ class ViewState:
     total_y: float
 
 
+@dataclass(slots=True, frozen=True)
+class MidiEditorPointerEvent:
+    seconds: float
+    plot_y: float
+    midi_pitch: int
+    modifiers: Qt.KeyboardModifier
+
+
+@dataclass(slots=True, frozen=True)
+class MidiEditorContextMenuRequest:
+    pointer_event: MidiEditorPointerEvent
+    global_pos: QPoint
+
+
 class SpectrogramView(pg.PlotWidget):
     """基于 PyQtGraph 的最小热图视图。"""
 
@@ -46,6 +63,10 @@ class SpectrogramView(pg.PlotWidget):
     seek_requested = pyqtSignal(float)
     note_audition_requested = pyqtSignal(object)
     view_state_changed = pyqtSignal(object)
+    midi_editor_pointer_pressed = pyqtSignal(object)
+    midi_editor_pointer_moved = pyqtSignal(object)
+    midi_editor_pointer_released = pyqtSignal(object)
+    midi_editor_context_menu_requested = pyqtSignal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent=parent)
@@ -67,6 +88,13 @@ class SpectrogramView(pg.PlotWidget):
         self._grid_division = GridDivision(4)
         self._max_grid_label_count = 128
         self._grid_label_items: list[QGraphicsSimpleTextItem] = []
+        self._midi_session = MidiSession()
+        self._midi_editor_state = self._midi_session.editor_state
+        self._midi_overlay_enabled = True
+        self._midi_note_overlay = MidiNoteOverlay()
+        self._midi_note_overlay.set_session(self._midi_session)
+        self._midi_note_overlay.set_editor_state(self._midi_editor_state)
+        self._attach_midi_session_signals(self._midi_session)
 
         plot_item = self.getPlotItem()
         plot_item.hideButtons()
@@ -88,8 +116,21 @@ class SpectrogramView(pg.PlotWidget):
         self.addItem(self._grid_beat_path_item, ignoreBounds=True)
         self.addItem(self._grid_bar_path_item, ignoreBounds=True)
 
+        self._dim_overlay_item = QGraphicsRectItem()
+        dim_pen = QPen()
+        dim_pen.setStyle(Qt.PenStyle.NoPen)
+        self._dim_overlay_item.setPen(dim_pen)
+        self._dim_overlay_item.setBrush(QBrush(QColor(0, 0, 0, 0)))
+        self._dim_overlay_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._dim_overlay_item.setZValue(1.0)
+        self._dim_overlay_item.hide()
+        self.addItem(self._dim_overlay_item, ignoreBounds=True)
+        for overlay_item in self._midi_note_overlay.graphics_items():
+            self.addItem(overlay_item, ignoreBounds=True)
+
         self._cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#FFD54F", width=2))
         self._cursor_line.hide()
+        self._cursor_line.setZValue(8)
         self.addItem(self._cursor_line)
 
         self._primary_band_item = self._create_band_item(
@@ -110,6 +151,9 @@ class SpectrogramView(pg.PlotWidget):
         self._cursor_line.hide()
         self._hide_all_hover_bands()
         self._clear_grid_overlay()
+        self._dim_overlay_item.setRect(QRectF())
+        self._dim_overlay_item.hide()
+        self._midi_note_overlay.set_result(None)
         self._last_hover_info = None
         self.view_state_changed.emit(ViewState(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
@@ -158,6 +202,7 @@ class SpectrogramView(pg.PlotWidget):
 
     def set_grid_timeline(self, timeline: MidiGridTimeline) -> None:
         self._grid_timeline = timeline
+        self._midi_note_overlay.set_timeline(timeline)
         self._refresh_grid_overlay()
 
     def set_grid_visible(self, visible: bool) -> None:
@@ -167,6 +212,48 @@ class SpectrogramView(pg.PlotWidget):
     def set_grid_division(self, division: GridDivision) -> None:
         self._grid_division = GridDivision(division.subdivisions_per_beat)
         self._refresh_grid_overlay()
+
+    def set_midi_session(self, session: MidiSession) -> None:
+        if not isinstance(session, MidiSession):
+            raise TypeError("session 必须是 MidiSession")
+        if session is not self._midi_session:
+            self._detach_midi_session_signals(self._midi_session)
+            self._midi_session = session
+            self._attach_midi_session_signals(self._midi_session)
+        self._midi_note_overlay.set_session(self._midi_session)
+        self._on_session_editor_state_changed(self._midi_session.editor_state)
+
+    def set_midi_editor_state(self, editor_state: MidiEditorState) -> None:
+        if not isinstance(editor_state, MidiEditorState):
+            raise TypeError("editor_state 必须是 MidiEditorState")
+        self._midi_editor_state = editor_state
+        self._midi_note_overlay.set_editor_state(editor_state)
+        self._refresh_midi_overlay_state()
+
+    def set_midi_overlay_visible(self, visible: bool) -> None:
+        self._midi_overlay_enabled = bool(visible)
+        self._refresh_midi_overlay_state()
+
+    def set_midi_overlay_darken_amount(self, amount: float) -> None:
+        self.set_midi_editor_state(self._midi_editor_state.with_updates(darken_amount=amount))
+
+    def midi_overlay_darken_amount(self) -> float:
+        return float(self._midi_editor_state.darken_amount)
+
+    def is_midi_overlay_visible(self) -> bool:
+        return self._midi_note_overlay.is_visible()
+
+    def is_dim_overlay_visible(self) -> bool:
+        return self._dim_overlay_item.isVisible()
+
+    def dim_overlay_alpha(self) -> int:
+        return int(self._dim_overlay_item.brush().color().alpha())
+
+    def midi_note_rect(self, note_id: str) -> QRectF | None:
+        return self._midi_note_overlay.note_rect(note_id)
+
+    def midi_note_at(self, seconds: float, plot_y: float) -> MidiNote | None:
+        return self._midi_note_overlay.hit_test(seconds, plot_y)
 
     def set_cqt_result(
         self,
@@ -187,6 +274,8 @@ class SpectrogramView(pg.PlotWidget):
         self._hide_all_hover_bands()
 
         self._apply_display_image()
+        self._midi_note_overlay.set_result(result, duration_seconds=self._duration_seconds)
+        self._update_dim_overlay_geometry()
 
         total_bins = float(result.num_bins)
         view_box = self.getViewBox()
@@ -214,6 +303,7 @@ class SpectrogramView(pg.PlotWidget):
         if cursor_seconds is None:
             cursor_seconds = 0.0
         self.set_cursor_seconds(float(cursor_seconds))
+        self._refresh_midi_overlay_state()
         self._refresh_grid_overlay()
 
     def update_display_settings(self, *, sensitivity: float, contrast: float) -> None:
@@ -340,6 +430,36 @@ class SpectrogramView(pg.PlotWidget):
             total_y=float(self._result.num_bins),
         )
 
+    def seconds_to_plot_x(self, seconds: float) -> float:
+        return float(seconds)
+
+    def plot_x_to_seconds(self, plot_x: float) -> float:
+        return float(plot_x)
+
+    def pitch_to_plot_y(self, pitch: int | float) -> float | None:
+        return self._midi_note_overlay.pitch_to_plot_y(pitch)
+
+    def midi_pitch_band(self, pitch: int | float) -> tuple[float, float] | None:
+        return self._midi_note_overlay.pitch_band_for_pitch(pitch)
+
+    def plot_y_to_midi_pitch(self, plot_y: float) -> int:
+        if self._result is None:
+            raise ValueError("当前没有频谱结果")
+        bin_index = bin_index_from_plot_y(plot_y, self._result.num_bins)
+        return int(round(frequency_to_midi(float(self._result.bin_frequencies[bin_index]))))
+
+    def set_midi_selection_rect(self, rect: QRectF | None) -> None:
+        self._midi_note_overlay.set_selection_rect(rect)
+
+    def midi_selection_rect(self) -> QRectF | None:
+        return self._midi_note_overlay.selection_rect()
+
+    def set_midi_preview_rect(self, rect: QRectF | None) -> None:
+        self._midi_note_overlay.set_preview_rect(rect)
+
+    def midi_preview_rect(self) -> QRectF | None:
+        return self._midi_note_overlay.preview_rect()
+
     def set_cursor_seconds(self, seconds: float) -> None:
         if self._result is None:
             return
@@ -398,6 +518,43 @@ class SpectrogramView(pg.PlotWidget):
         )
         self._image_item.setImage(image, autoLevels=False, levels=(0.0, 1.0))
         self._image_item.setRect(QRectF(0.0, 0.0, self._duration_seconds, float(self._result.num_bins)))
+
+    def _update_dim_overlay_geometry(self) -> None:
+        if self._result is None:
+            self._dim_overlay_item.setRect(QRectF())
+            self._dim_overlay_item.hide()
+            return
+        self._dim_overlay_item.setRect(QRectF(0.0, 0.0, self._duration_seconds, float(self._result.num_bins)))
+        self._refresh_dim_overlay()
+
+    def _refresh_dim_overlay(self) -> None:
+        if self._result is None or not self._midi_editor_state.enabled:
+            self._dim_overlay_item.hide()
+            return
+        alpha = int(round(max(0.0, min(1.0, self._midi_editor_state.darken_amount)) * 255.0))
+        self._dim_overlay_item.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+        self._dim_overlay_item.setVisible(alpha > 0)
+
+    def _refresh_midi_overlay_state(self) -> None:
+        overlay_visible = self._midi_overlay_enabled and self._midi_editor_state.enabled and self._result is not None
+        self._midi_note_overlay.set_visible(overlay_visible)
+        self._refresh_dim_overlay()
+
+    def _attach_midi_session_signals(self, session: MidiSession) -> None:
+        session.editor_state_changed.connect(self._on_session_editor_state_changed)
+
+    def _detach_midi_session_signals(self, session: MidiSession) -> None:
+        try:
+            session.editor_state_changed.disconnect(self._on_session_editor_state_changed)
+        except (TypeError, RuntimeError):
+            return
+
+    def _on_session_editor_state_changed(self, editor_state: object) -> None:
+        if not isinstance(editor_state, MidiEditorState):
+            return
+        self._midi_editor_state = editor_state
+        self._midi_note_overlay.set_editor_state(editor_state)
+        self._refresh_midi_overlay_state()
 
     def _create_path_item(self, color: QColor, *, z_value: float) -> QGraphicsPathItem:
         pen = QPen(color, 1)
@@ -628,10 +785,43 @@ class SpectrogramView(pg.PlotWidget):
         self.hover_changed.emit(hover_info)
 
     def mousePressEvent(self, event) -> None:
+        if self._midi_editor_state.enabled:
+            pointer_event = self._map_mouse_event_to_pointer_event(event, clamp=False)
+            if event.button() == Qt.MouseButton.LeftButton and pointer_event is not None:
+                self.midi_editor_pointer_pressed.emit(pointer_event)
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton and pointer_event is not None:
+                self.midi_editor_context_menu_requested.emit(
+                    MidiEditorContextMenuRequest(
+                        pointer_event=pointer_event,
+                        global_pos=event.globalPosition().toPoint(),
+                    )
+                )
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
             scene_position = self.mapToScene(event.position().toPoint())
             self._emit_click_interaction(scene_position)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._midi_editor_state.enabled and event.buttons() & Qt.MouseButton.LeftButton:
+            pointer_event = self._map_mouse_event_to_pointer_event(event, clamp=True)
+            if pointer_event is not None:
+                self.midi_editor_pointer_moved.emit(pointer_event)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._midi_editor_state.enabled and event.button() == Qt.MouseButton.LeftButton:
+            pointer_event = self._map_mouse_event_to_pointer_event(event, clamp=True)
+            if pointer_event is not None:
+                self.midi_editor_pointer_released.emit(pointer_event)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
 
     def _emit_click_interaction(self, scene_position) -> None:
         if self._result is None:
@@ -653,6 +843,29 @@ class SpectrogramView(pg.PlotWidget):
             return
         target = max(0.0, min(float(point.x()), self._max_time()))
         self.seek_requested.emit(target)
+
+    def _map_mouse_event_to_pointer_event(self, event, *, clamp: bool) -> MidiEditorPointerEvent | None:
+        if self._result is None:
+            return None
+        scene_position = self.mapToScene(event.position().toPoint())
+        if not clamp and not self.sceneBoundingRect().contains(scene_position):
+            return None
+
+        point = self.getViewBox().mapSceneToView(scene_position)
+        seconds = float(point.x())
+        plot_y = float(point.y())
+        if clamp:
+            seconds = max(0.0, min(seconds, self._max_time()))
+            plot_y = max(0.0, min(plot_y, float(self._result.num_bins) - 1e-6))
+        elif seconds < 0.0 or seconds > self._max_time() or plot_y < 0.0 or plot_y > float(self._result.num_bins):
+            return None
+
+        return MidiEditorPointerEvent(
+            seconds=seconds,
+            plot_y=plot_y,
+            midi_pitch=self.plot_y_to_midi_pitch(plot_y),
+            modifiers=event.modifiers(),
+        )
 
     def _on_view_box_range_changed(self, *_args) -> None:
         if self._grid_visible:

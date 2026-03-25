@@ -123,3 +123,25 @@ def test_midi_playback_controller_respects_solo_channels_and_forwards_gain(qapp:
     assert any(config.channel == 1 and config.solo for config in synth.applied_channel_configs)
     assert synth.note_on_calls == [(1, 67, 90)]
     assert controller.active_note_ids == frozenset({"b"})
+
+
+def test_midi_playback_controller_reacts_to_live_session_updates(qapp: QApplication) -> None:
+    _ = qapp
+    engine = _FakePlaybackEngine()
+    synth = _FakeSynth()
+    session = MidiSession()
+
+    controller = MidiPlaybackController(engine, synth, session=session, poll_interval_ms=10)
+
+    engine.set_playing(True)
+    session.add_note(MidiNote(id="live", pitch=72, start_beat=0.0, duration_beats=2.0, velocity=84, channel=2))
+
+    assert controller.scheduled_notes[0].note_id == "live"
+    assert synth.note_on_calls == [(2, 72, 84)]
+    assert controller.active_note_ids == frozenset({"live"})
+
+    session.update_channel_config(2, muted=True)
+
+    assert any(config.channel == 2 and config.muted for config in synth.applied_channel_configs)
+    assert synth.note_off_calls[-1] == (2, 72)
+    assert controller.active_note_ids == frozenset()

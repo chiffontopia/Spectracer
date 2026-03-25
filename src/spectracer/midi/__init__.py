@@ -1,5 +1,15 @@
 """MIDI related modules (synth, editor model, grid, export)."""
 
+from spectracer.midi.commands import (
+    AddNoteCommand,
+    CommandStack,
+    CommandStackState,
+    DeleteNotesCommand,
+    MoveNotesCommand,
+    ResizeNotesCommand,
+    UpdateChannelConfigCommand,
+    UpdateNotePropertyCommand,
+)
 from spectracer.midi.editor_model import (
     EventTrackLane,
     EventTrackSelection,
@@ -13,6 +23,7 @@ from spectracer.midi.editor_model import (
     MidiSnapResolution,
     default_midi_channel_configs,
 )
+from spectracer.midi.exporter import LinearTempoExportStrategy, export_notes_to_midi
 from spectracer.midi.grid import (
     BarPosition,
     GridDivision,
@@ -28,6 +39,10 @@ from spectracer.midi.grid import (
 from spectracer.midi.session import MidiSession
 
 __all__ = [
+    "AddNoteCommand",
+    "CommandStack",
+    "CommandStackState",
+    "DeleteNotesCommand",
     "EventTrackLane",
     "EventTrackSelection",
     "MidiChannelConfig",
@@ -39,7 +54,13 @@ __all__ = [
     "MidiProjectState",
     "MidiSession",
     "MidiSnapResolution",
+    "MoveNotesCommand",
+    "ResizeNotesCommand",
+    "UpdateChannelConfigCommand",
+    "UpdateNotePropertyCommand",
     "default_midi_channel_configs",
+    "LinearTempoExportStrategy",
+    "export_notes_to_midi",
     "BarPosition",
     "GridDivision",
     "GridLine",

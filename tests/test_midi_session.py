@@ -72,3 +72,30 @@ def test_session_updates_editor_and_channel_state() -> None:
     assert config.program == 33
     assert config.pan == 20
     assert config.color == "#123456"
+
+
+def test_session_emits_observer_signals_for_live_updates() -> None:
+    session = MidiSession()
+    note_events: list[tuple[str, ...]] = []
+    selection_events: list[tuple[str, ...]] = []
+    editor_events: list[bool] = []
+    channel_events: list[tuple[str, ...]] = []
+
+    session.notes_changed.connect(lambda notes: note_events.append(tuple(note.id for note in notes)))
+    session.selection_changed.connect(lambda notes: selection_events.append(tuple(note.id for note in notes)))
+    session.editor_state_changed.connect(lambda state: editor_events.append(bool(state.enabled)))
+    session.channel_configs_changed.connect(lambda configs: channel_events.append(tuple(config.display_name for config in configs[:2])))
+
+    note = MidiNote(id="sig-note", pitch=60, start_beat=0.0, duration_beats=0.5, channel=1)
+    session.add_note(note, select=True)
+    session.update_editor_state(enabled=True)
+    session.update_channel_config(1, name="Lead")
+    session.remove_note(note.id)
+
+    assert note_events == [
+        ("sig-note",),
+        (),
+    ]
+    assert selection_events == [("sig-note",), ()]
+    assert editor_events == [True]
+    assert channel_events[-1] == ("Channel 01", "Lead")
