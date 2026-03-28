@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import sys
 import json
+import shutil
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -60,6 +62,7 @@ from spectracer.midi.session import MidiSession
 from spectracer.midi.synth import DEFAULT_GAIN, MidiSynth, create_default_midi_synth
 from spectracer.dsp.colormap import ColorStop, default_spectracer_colormap_stops, normalize_colormap_stops
 from spectracer.dsp.visualization import NormalizationMode
+from spectracer.project.cache_store import CacheStore
 from spectracer.ui.dialogs.analysis_options_dialog import AnalysisOptionsDialog
 from spectracer.ui.dialogs.channel_config_dialog import ChannelConfigDialog
 from spectracer.ui.dialogs.grid_event_dialog import TempoEventDialog, TimeSignatureEventDialog
@@ -294,6 +297,8 @@ class SpectracerMainWindow(QMainWindow):
         self._display_contrast = self._runtime_config.contrast
         self._last_view_state: ViewState | None = None
         self._settings = QSettings("Spectracer", "Spectracer")
+        self._cache_disabled = self._read_bool_setting("cache/disabled", False)
+        self._transient_analysis_cache_dir: Path | None = None
         raw_follow_cursor = self._settings.value("playback/follow_cursor", True)
         if isinstance(raw_follow_cursor, bool):
             self._follow_cursor_enabled = raw_follow_cursor
@@ -406,6 +411,10 @@ class SpectracerMainWindow(QMainWindow):
         self.export_midi_action = QAction("导出 MIDI...", self)
         self.midi_settings_action = QAction("MIDI...", self)
         self.grid_settings_action = QAction("网格...", self)
+        self.cache_disabled_action = QAction("无缓存模式", self)
+        self.cache_disabled_action.setCheckable(True)
+        self.cache_disabled_action.setChecked(self._cache_disabled)
+        self.clear_cache_action = QAction("清理未使用缓存…", self)
         self.grid_toggle_action = QAction("显示网格", self)
         self.grid_toggle_action.setCheckable(True)
         self.grid_toggle_action.setChecked(self._grid_settings.visible)
@@ -416,7 +425,13 @@ class SpectracerMainWindow(QMainWindow):
         self.project_toolbar_button = self._create_toolbar_menu_button(
             text="项目",
             tooltip="项目相关操作。",
-            actions=(self.open_action, self.export_midi_action),
+            actions=(
+                self.open_action,
+                self.export_midi_action,
+                None,
+                self.cache_disabled_action,
+                self.clear_cache_action,
+            ),
         )
         self.history_view_toolbar_button = self._create_toolbar_menu_button(
             text="历史/视图",
@@ -731,6 +746,8 @@ class SpectracerMainWindow(QMainWindow):
         self.colormap_action.triggered.connect(self._open_colormap_editor)
         self.export_midi_action.triggered.connect(self._open_export_midi_dialog)
         self.midi_settings_action.triggered.connect(self._open_midi_settings_dialog)
+        self.cache_disabled_action.toggled.connect(self._on_cache_disabled_toggled)
+        self.clear_cache_action.triggered.connect(self._cleanup_unused_analysis_cache)
         self.grid_settings_action.triggered.connect(self._open_grid_settings_dialog)
         self.grid_toggle_action.toggled.connect(self._on_grid_visibility_toggled)
         self.event_track_toggle_action.toggled.connect(self._on_event_track_visibility_toggled)
@@ -809,6 +826,74 @@ class SpectracerMainWindow(QMainWindow):
         self._session_config = selected_config
         self._session_channel_modes = selected_channel_modes
         self._start_analysis(audio_path, selected_config, selected_channel_modes)
+
+    def _on_cache_disabled_toggled(self, enabled: bool) -> None:
+        self._cache_disabled = bool(enabled)
+        self._settings.setValue("cache/disabled", self._cache_disabled)
+        if self._cache_disabled:
+            self.status_message.setText("已启用无缓存模式：后续分析将写入临时目录，并在切换文件或退出时清理。")
+            return
+        self.status_message.setText("已启用持久缓存：后续分析会优先复用 .spectracer_cache。")
+
+    def _prepare_analysis_output_dir(self) -> Path:
+        if not self._cache_disabled:
+            self._cleanup_transient_analysis_cache_dir()
+            return DEFAULT_CACHE_DIR
+
+        self._cleanup_transient_analysis_cache_dir()
+        temp_root = Path(tempfile.gettempdir()) / "spectracer"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self._transient_analysis_cache_dir = Path(tempfile.mkdtemp(prefix="analysis-", dir=str(temp_root)))
+        return self._transient_analysis_cache_dir
+
+    def _cleanup_transient_analysis_cache_dir(self) -> None:
+        if self._transient_analysis_cache_dir is None:
+            return
+        shutil.rmtree(self._transient_analysis_cache_dir, ignore_errors=True)
+        self._transient_analysis_cache_dir = None
+
+    def _active_persistent_cache_keys(self) -> set[str]:
+        try:
+            persistent_root = DEFAULT_CACHE_DIR.resolve()
+        except OSError:
+            return set()
+
+        active_keys: set[str] = set()
+        for result in self._channel_results.values():
+            try:
+                result_root = result.cache_paths.root.resolve()
+            except OSError:
+                continue
+            if result_root.is_relative_to(persistent_root):
+                active_keys.add(result.cache_key)
+        return active_keys
+
+    def _cleanup_unused_analysis_cache(self, checked: bool = False, *, require_confirmation: bool = True) -> None:
+        _ = checked
+        if self._analysis_busy:
+            self.status_message.setText("正在分析，暂时无法清理缓存。")
+            return
+
+        active_cache_keys = self._active_persistent_cache_keys()
+        if require_confirmation:
+            preserved_text = "当前音频相关缓存将被保留。" if active_cache_keys else "当前没有需要保留的活动缓存。"
+            answer = QMessageBox.question(
+                self,
+                "清理缓存",
+                f"将清理未被当前音频使用的分析缓存。\n{preserved_text}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        cleanup_result = CacheStore(DEFAULT_CACHE_DIR).cleanup_unused(exclude_cache_keys=active_cache_keys)
+        if cleanup_result.removed_count == 0:
+            self.status_message.setText("没有可清理的未使用缓存。")
+            return
+        self.status_message.setText(
+            f"已清理 {cleanup_result.removed_count} 个缓存项，释放 {self._format_byte_size(cleanup_result.freed_bytes)}。"
+        )
 
     def toggle_playback(self) -> None:
         if self._analysis_busy and not self._analysis_primary_ready:
@@ -1601,10 +1686,12 @@ class SpectracerMainWindow(QMainWindow):
         progress_dialog.setLabelText("正在分析，请稍候...")
         QApplication.processEvents()
 
+        analysis_output_dir = self._prepare_analysis_output_dir()
+
         self._analysis_thread = QThread(self)
         self._analysis_worker = AnalysisWorker(
             audio_path=audio_path,
-            output_dir=DEFAULT_CACHE_DIR,
+            output_dir=analysis_output_dir,
             config=config,
             channel_modes=self._analysis_requested_modes,
         )
@@ -2019,6 +2106,7 @@ class SpectracerMainWindow(QMainWindow):
         self.status_message.setText(str(progress.message))
 
     def _on_analysis_finished(self, batch_result: MultiChannelAnalysisResult) -> None:
+        self._close_progress_dialog()
         ordered_modes = [mode for mode in ChannelMode.ordered_modes() if mode in batch_result.results_by_mode]
         if not ordered_modes:
             self._show_error("未生成任何分析结果")
@@ -2029,12 +2117,19 @@ class SpectracerMainWindow(QMainWindow):
             self._channel_results[mode] = batch_result.results_by_mode[mode]
         self._populate_channel_mode_combo(ordered_modes)
         preferred_mode = self._analysis_primary_mode or ordered_modes[0]
-        self._set_channel_mode(preferred_mode, force_audio_reload=True)
+        preferred_result = self._channel_results.get(preferred_mode)
+        should_activate_mode = (
+            self._current_channel_mode != preferred_mode
+            or self._current_result is not preferred_result
+        )
+        if should_activate_mode:
+            self._set_channel_mode(preferred_mode, force_audio_reload=True)
         self.file_label.setText(str(batch_result.input_path.name))
         self._current_audio_path = batch_result.input_path
         self._set_analysis_busy(False)
 
     def _on_analysis_failed(self, message: str) -> None:
+        self._close_progress_dialog()
         self._show_error(message)
         self._set_analysis_busy(False)
 
@@ -2191,6 +2286,7 @@ class SpectracerMainWindow(QMainWindow):
         self._midi_editor_controller.close()
         self._midi_playback_controller.close()
         self.midi_synth.close()
+        self._cleanup_transient_analysis_cache_dir()
         super().closeEvent(event)
 
     def _show_error(self, message: str) -> None:
@@ -2240,6 +2336,19 @@ class SpectracerMainWindow(QMainWindow):
 
     def _format_percent_label(self, value: float) -> str:
         return f"{int(round(max(0.0, min(1.0, float(value))) * 100.0))}%"
+
+    def _format_byte_size(self, size_bytes: int) -> str:
+        size = max(0.0, float(size_bytes))
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit_index = 0
+        while size >= 1024.0 and unit_index < len(units) - 1:
+            size /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        if size >= 100.0:
+            return f"{size:.0f} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
 
     def _toggle_edit_mode_shortcut(self) -> None:
         self._apply_midi_editor_state(

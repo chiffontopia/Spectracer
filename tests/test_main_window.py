@@ -177,3 +177,71 @@ def test_analysis_worker_sets_playback_audio_generation_when_needed(
     worker.run()
 
     assert captured_flags == [expected_save_playback_audio]
+
+
+def test_on_analysis_finished_reuses_primary_result_without_duplicate_activation() -> None:
+    class _Label:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _Window:
+        def __init__(self) -> None:
+            self.closed_progress = 0
+            self.ordered_modes = None
+            self.activated_modes: list[ChannelMode] = []
+            self.busy_states: list[bool] = []
+            self.file_label = _Label()
+            self._analysis_primary_mode = ChannelMode.LEFT
+            self._current_channel_mode = ChannelMode.LEFT
+            self._current_result = object()
+            self._channel_results = {ChannelMode.LEFT: self._current_result}
+            self._current_audio_path = None
+
+        def _close_progress_dialog(self) -> None:
+            self.closed_progress += 1
+
+        def _populate_channel_mode_combo(self, ordered_modes) -> None:
+            self.ordered_modes = list(ordered_modes)
+
+        def _set_channel_mode(self, mode: ChannelMode, *, force_audio_reload: bool = False) -> None:
+            _ = force_audio_reload
+            self.activated_modes.append(mode)
+
+        def _set_analysis_busy(self, busy: bool) -> None:
+            self.busy_states.append(bool(busy))
+
+    window = _Window()
+    batch_result = type(
+        "_BatchResult",
+        (),
+        {"results_by_mode": {ChannelMode.LEFT: window._current_result}, "input_path": Path("cached.wav")},
+    )()
+
+    SpectracerMainWindow._on_analysis_finished(window, batch_result)
+
+    assert window.closed_progress == 1
+    assert window.ordered_modes == [ChannelMode.LEFT]
+    assert window.activated_modes == []
+    assert window.file_label.text == "cached.wav"
+    assert window._current_audio_path == Path("cached.wav")
+    assert window.busy_states == [False]
+
+
+def test_on_analysis_failed_closes_progress_dialog_before_reporting_error() -> None:
+    events: list[str] = []
+    window = type(
+        "_Window",
+        (),
+        {
+            "_close_progress_dialog": lambda self: events.append("close"),
+            "_show_error": lambda self, message: events.append(f"error:{message}"),
+            "_set_analysis_busy": lambda self, busy: events.append(f"busy:{busy}"),
+        },
+    )()
+
+    SpectracerMainWindow._on_analysis_failed(window, "boom")
+
+    assert events == ["close", "error:boom", "busy:False"]

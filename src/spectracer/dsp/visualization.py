@@ -4,8 +4,9 @@ from enum import Enum
 from pathlib import Path
 
 import librosa
-import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 
 from spectracer.core.models import CqtResult
 from spectracer.dsp.colormap import make_spectracer_colormap
@@ -97,7 +98,10 @@ def save_cqt_heatmap(
     bottom = float(result.bin_frequencies[0])
     top = float(result.bin_frequencies[-1])
 
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
+    # 仅使用 Agg canvas，避免在工作线程中触发 Matplotlib GUI backend。
+    fig = Figure(figsize=(12, 6), dpi=150)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
     image = ax.imshow(
         normalized,
         origin="lower",
@@ -117,6 +121,6 @@ def save_cqt_heatmap(
 
     fig.tight_layout()
     fig.savefig(output)
-    plt.close(fig)
+    fig.clear()
 
     return output

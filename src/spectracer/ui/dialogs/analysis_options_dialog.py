@@ -22,6 +22,20 @@ from spectracer.core.config import AnalyzeCliConfig
 from spectracer.core.models import AnalysisParams, ChannelMode
 
 
+RECOMMENDED_SAMPLE_RATE = 48000
+
+COMMON_SAMPLE_RATES: tuple[int | None, ...] = (
+    None,
+    22050,
+    32000,
+    44100,
+    48000,
+    88200,
+    96000,
+    192000,
+)
+
+
 @dataclass(slots=True)
 class AnalysisDialogResult:
     config: AnalyzeCliConfig
@@ -118,12 +132,18 @@ class AnalysisOptionsDialog(QDialog):
         self.a4_spin.setValue(initial_config.a4_hz)
         analysis_form.addRow("A4 频率 (Hz)", self.a4_spin)
 
-        self.sample_rate_spin = QSpinBox(self)
-        self.sample_rate_spin.setRange(0, 192000)
-        self.sample_rate_spin.setSingleStep(11025)
-        self.sample_rate_spin.setSpecialValueText("原采样率")
-        self.sample_rate_spin.setValue(0 if initial_config.sample_rate is None else initial_config.sample_rate)
-        analysis_form.addRow("重采样率", self.sample_rate_spin)
+        self.sample_rate_combo = QComboBox(self)
+        for sample_rate in COMMON_SAMPLE_RATES:
+            label = self._sample_rate_label(sample_rate)
+            self.sample_rate_combo.addItem(label, sample_rate)
+        initial_sample_rate = initial_config.sample_rate
+        if initial_sample_rate not in COMMON_SAMPLE_RATES:
+            self.sample_rate_combo.addItem(self._sample_rate_label(initial_sample_rate), int(initial_sample_rate))
+        self.sample_rate_combo.setCurrentIndex(
+            max(0, self.sample_rate_combo.findData(initial_sample_rate))
+        )
+        self.sample_rate_combo.setToolTip("可直接选择常见采样率；当前 CQT 路径下 48kHz 通常有更好的解析性能。")
+        analysis_form.addRow("重采样率", self.sample_rate_combo)
 
         root_layout.addWidget(analysis_group)
 
@@ -182,7 +202,7 @@ class AnalysisOptionsDialog(QDialog):
             octave_min=int(self.octave_min_spin.value()),
             octave_max=int(self.octave_max_spin.value()),
             a4_hz=float(self.a4_spin.value()),
-            sample_rate=None if self.sample_rate_spin.value() == 0 else int(self.sample_rate_spin.value()),
+            sample_rate=self._selected_sample_rate(),
             sensitivity=float(self.sensitivity_spin.value()),
             contrast=float(self.contrast_spin.value()),
             preview_enabled=self._initial_config.preview_enabled,
@@ -200,6 +220,19 @@ class AnalysisOptionsDialog(QDialog):
         )
         params.validate()
         return config
+
+    def _sample_rate_label(self, sample_rate: int | None) -> str:
+        if sample_rate is None:
+            return "原采样率"
+        if int(sample_rate) == RECOMMENDED_SAMPLE_RATE:
+            return f"{int(sample_rate)} Hz（推荐）"
+        return f"{int(sample_rate)} Hz"
+
+    def _selected_sample_rate(self) -> int | None:
+        value = self.sample_rate_combo.currentData()
+        if value is None:
+            return None
+        return int(value)
 
     def accept(self) -> None:
         try:

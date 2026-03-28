@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -304,13 +305,41 @@ def test_main_window_toolbar_groups_project_and_history_view_actions(
 
     project_menu = window.project_toolbar_button.menu()
     assert project_menu is not None
-    assert [action.text() for action in project_menu.actions() if not action.isSeparator()] == ["打开音频", "导出 MIDI..."]
+    assert [action.text() for action in project_menu.actions() if not action.isSeparator()] == [
+        "打开音频",
+        "导出 MIDI...",
+        "无缓存模式",
+        "清理未使用缓存…",
+    ]
 
     history_view_menu = window.history_view_toolbar_button.menu()
     assert history_view_menu is not None
     assert [action.text() for action in history_view_menu.actions() if not action.isSeparator()] == ["撤销", "重做", "重置视图", "横向放大", "横向缩小", "纵向放大", "纵向缩小"]
 
     window.close()
+
+
+def test_main_window_no_cache_mode_uses_temporary_analysis_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    settings_store: dict[str, object] = {}
+    _patch_main_window_environment(monkeypatch, settings_store)
+    monkeypatch.setattr(main_window_module, "DEFAULT_CACHE_DIR", tmp_path / ".spectracer_cache")
+
+    window = SpectracerMainWindow()
+    window.show()
+    window.cache_disabled_action.setChecked(True)
+    qapp.processEvents()
+
+    output_dir = window._prepare_analysis_output_dir()
+    assert settings_store["cache/disabled"] is True
+    assert output_dir.exists()
+    assert output_dir != main_window_module.DEFAULT_CACHE_DIR
+
+    window.close()
+    assert output_dir.exists() is False
 
 
 def test_main_window_editor_shortcuts_and_session_signals_keep_controls_in_sync(

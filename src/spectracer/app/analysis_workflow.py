@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
+import librosa
 import numpy as np
 import soundfile as sf
 
@@ -56,6 +57,57 @@ class MultiChannelAnalysisResult:
     total_ms: float
 
 
+@dataclass(slots=True)
+class _SharedLrCqtState:
+    left_complex: np.ndarray
+    right_complex: np.ndarray
+    frame_times: np.ndarray
+    bin_frequencies: np.ndarray
+    hop_length: int
+    sample_rate: int
+    _left_magnitude: np.ndarray | None = None
+    _right_magnitude: np.ndarray | None = None
+
+    def build_result(self, mode: ChannelMode) -> CqtResult:
+        if mode == ChannelMode.LEFT:
+            magnitude = self._left_magnitude_array()
+        elif mode == ChannelMode.RIGHT:
+            magnitude = self._right_magnitude_array()
+        elif mode == ChannelMode.STEREO:
+            magnitude = np.maximum(self._left_magnitude_array(), self._right_magnitude_array()).astype(np.float32)
+        elif mode == ChannelMode.MONO:
+            magnitude = np.abs((self.left_complex + self.right_complex) * 0.5).T.astype(np.float32)
+        elif mode == ChannelMode.SIDE:
+            magnitude = np.abs(self.left_complex - self.right_complex).T.astype(np.float32)
+        else:  # pragma: no cover
+            raise ValueError(f"未处理的共享 CQT 声道模式: {mode}")
+        return CqtResult(
+            magnitude=magnitude,
+            frame_times=self.frame_times,
+            bin_frequencies=self.bin_frequencies,
+            hop_length=self.hop_length,
+            sample_rate=self.sample_rate,
+        )
+
+    def _left_magnitude_array(self) -> np.ndarray:
+        if self._left_magnitude is None:
+            self._left_magnitude = np.abs(self.left_complex).T.astype(np.float32)
+        return self._left_magnitude
+
+    def _right_magnitude_array(self) -> np.ndarray:
+        if self._right_magnitude is None:
+            self._right_magnitude = np.abs(self.right_complex).T.astype(np.float32)
+        return self._right_magnitude
+
+    def release(self) -> None:
+        self._left_magnitude = None
+        self._right_magnitude = None
+        self.left_complex = np.empty((0, 0), dtype=np.complex64)
+        self.right_complex = np.empty((0, 0), dtype=np.complex64)
+        self.frame_times = np.empty((0,), dtype=np.float32)
+        self.bin_frequencies = np.empty((0,), dtype=np.float32)
+
+
 ProgressCallback = Callable[[AnalysisProgress], None]
 ModeResultCallback = Callable[[ChannelMode, AnalyzeExecutionResult], None]
 
@@ -75,6 +127,23 @@ def execute_analysis(
 
     opts = options or AnalyzeExecutionOptions()
     total_steps = _progress_total_steps(mode_count=1, options=opts)
+    _report_progress(progress_callback, 0, total_steps, "准备检查缓存")
+
+    resolved_sample_rate = _resolve_effective_sample_rate(resolved_input, params.sample_rate)
+    source_audio_fingerprint = file_fingerprint(resolved_input)
+    effective_params = replace(params, sample_rate=resolved_sample_rate)
+    cache_store = CacheStore(output_dir)
+    cached_result = _load_cached_execution_result(
+        source_audio_path=resolved_input,
+        cache_store=cache_store,
+        params=effective_params,
+        options=opts,
+        source_audio_fingerprint=source_audio_fingerprint,
+    )
+    if cached_result is not None:
+        _report_progress(progress_callback, total_steps, total_steps, "已从缓存恢复分析结果", effective_params.channel_mode)
+        return cached_result
+
     _report_progress(progress_callback, 0, total_steps, "准备加载音频")
 
     load_start = perf_counter()
@@ -82,7 +151,7 @@ def execute_analysis(
     load_audio_ms = (perf_counter() - load_start) * 1000.0
 
     _report_progress(progress_callback, 1, total_steps, "音频加载完成", params.channel_mode)
-    result, _ = _execute_analysis_from_loaded_audio(
+    result, completed_steps = _execute_analysis_from_loaded_audio(
         source_audio_path=resolved_input,
         audio=audio,
         loaded_sample_rate=loaded_sample_rate,
@@ -90,11 +159,12 @@ def execute_analysis(
         params=params,
         options=opts,
         load_audio_ms=load_audio_ms,
-        source_audio_fingerprint=None,
+        source_audio_fingerprint=source_audio_fingerprint,
         completed_steps=1,
         total_steps=total_steps,
         progress_callback=progress_callback,
     )
+    _report_progress(progress_callback, total_steps, total_steps, "分析完成", params.channel_mode)
     return result
 
 
@@ -121,24 +191,61 @@ def execute_multi_channel_analysis(
     total_steps = _progress_total_steps(mode_count=len(modes), options=opts)
     total_start = perf_counter()
 
+    _report_progress(progress_callback, 0, total_steps, "准备检查缓存")
+    resolved_sample_rate = _resolve_effective_sample_rate(resolved_input, params.sample_rate)
+    source_audio_fingerprint = file_fingerprint(resolved_input)
+    cache_store = CacheStore(output_dir)
+
+    cached_results: dict[ChannelMode, AnalyzeExecutionResult] = {}
+    missing_modes: list[ChannelMode] = []
+    for mode in modes:
+        effective_params = replace(params, channel_mode=mode, sample_rate=resolved_sample_rate)
+        cached_result = _load_cached_execution_result(
+            source_audio_path=resolved_input,
+            cache_store=cache_store,
+            params=effective_params,
+            options=opts,
+            source_audio_fingerprint=source_audio_fingerprint,
+        )
+        if cached_result is None:
+            missing_modes.append(mode)
+            continue
+        cached_results[mode] = cached_result
+
+    if missing_modes and mode_result_callback is not None:
+        for mode in modes:
+            cached_result = cached_results.get(mode)
+            if cached_result is not None:
+                mode_result_callback(mode, cached_result)
+
+    if not missing_modes:
+        _report_progress(progress_callback, total_steps, total_steps, "已从缓存恢复全部结果")
+        total_ms = (perf_counter() - total_start) * 1000.0
+        return MultiChannelAnalysisResult(
+            input_path=resolved_input,
+            results_by_mode={mode: cached_results[mode] for mode in modes},
+            load_audio_ms=0.0,
+            total_ms=total_ms,
+        )
+
     _report_progress(progress_callback, 0, total_steps, "准备加载音频")
     load_start = perf_counter()
     audio, loaded_sample_rate = load_audio(resolved_input, target_sample_rate=params.sample_rate)
     load_audio_ms = (perf_counter() - load_start) * 1000.0
-    source_audio_fingerprint = file_fingerprint(resolved_input)
     _report_progress(progress_callback, 1, total_steps, "音频加载完成")
 
     completed_steps = 1
 
     # 性能优化：当输入为 1~2 声道且同时需要多个模式时，CQT 可以在频域复用。
     # 计算一次 Left/Right 的 complex CQT，即可通过线性组合得到 mono/side，并复用 left/right/stereo。
-    precomputed_cqt_results: dict[ChannelMode, CqtResult] = {}
+    shared_cqt_state: _SharedLrCqtState | None = None
     shared_cqt_ms = 0.0
-    if audio.ndim == 2 and 1 <= audio.shape[0] <= 2 and len(modes) >= 2:
+    shared_supported_modes: set[ChannelMode] = set()
+    if audio.ndim == 2 and 1 <= audio.shape[0] <= 2 and len(missing_modes) >= 2:
         channel_count = int(audio.shape[0])
 
         naive_cqt_count = 0
-        for mode in modes:
+        for mode in missing_modes:
             if mode == ChannelMode.STEREO and channel_count > 1:
                 naive_cqt_count += 2
             else:
@@ -148,19 +255,21 @@ def execute_multi_channel_analysis(
         if optimized_cqt_count < naive_cqt_count:
             _report_progress(progress_callback, completed_steps, total_steps, "计算共享 CQT（L/R）")
             shared_start = perf_counter()
-            precomputed_cqt_results = _precompute_cqt_results_from_lr(
+            shared_cqt_state = _prepare_shared_cqt_from_lr(
                 audio=audio,
                 sample_rate=loaded_sample_rate,
                 params=params,
-                modes=modes,
             )
+            shared_supported_modes = set(missing_modes)
             shared_cqt_ms = (perf_counter() - shared_start) * 1000.0
             _report_progress(progress_callback, completed_steps, total_steps, "共享 CQT 计算完成")
-    results_by_mode: dict[ChannelMode, AnalyzeExecutionResult] = {}
-    for mode in modes:
+    results_by_mode: dict[ChannelMode, AnalyzeExecutionResult] = dict(cached_results)
+    for mode in missing_modes:
         mode_params = replace(params, channel_mode=mode)
-        precomputed_cqt_result = precomputed_cqt_results.get(mode)
-        precomputed_cqt_ms = shared_cqt_ms if mode == modes[0] and precomputed_cqt_result is not None else 0.0
+        precomputed_cqt_result = None
+        if shared_cqt_state is not None and mode in shared_supported_modes:
+            precomputed_cqt_result = shared_cqt_state.build_result(mode)
+        precomputed_cqt_ms = shared_cqt_ms if mode == missing_modes[0] and precomputed_cqt_result is not None else 0.0
         analysis_result, completed_steps = _execute_analysis_from_loaded_audio(
             source_audio_path=resolved_input,
             audio=audio,
@@ -179,13 +288,76 @@ def execute_multi_channel_analysis(
         results_by_mode[mode] = analysis_result
         if mode_result_callback is not None:
             mode_result_callback(mode, analysis_result)
+    if shared_cqt_state is not None:
+        shared_cqt_state.release()
 
     total_ms = (perf_counter() - total_start) * 1000.0
+    _report_progress(progress_callback, total_steps, total_steps, "分析完成")
     return MultiChannelAnalysisResult(
         input_path=resolved_input,
-        results_by_mode=results_by_mode,
+        results_by_mode={mode: results_by_mode[mode] for mode in modes},
         load_audio_ms=load_audio_ms,
         total_ms=total_ms,
+    )
+
+
+def _resolve_effective_sample_rate(source_audio_path: Path, requested_sample_rate: int | None) -> int:
+    if requested_sample_rate is not None:
+        return int(requested_sample_rate)
+    try:
+        return int(sf.info(str(source_audio_path)).samplerate)
+    except Exception:  # noqa: BLE001
+        try:
+            return int(librosa.get_samplerate(path=str(source_audio_path)))
+        except Exception:  # noqa: BLE001
+            _, sample_rate = load_audio(source_audio_path, target_sample_rate=None)
+            return int(sample_rate)
+
+
+def _load_cached_execution_result(
+    *,
+    source_audio_path: Path,
+    cache_store: CacheStore,
+    params: AnalysisParams,
+    options: AnalyzeExecutionOptions,
+    source_audio_fingerprint: str,
+) -> AnalyzeExecutionResult | None:
+    stage_start = perf_counter()
+    cache_key = cache_store.build_cache_key(
+        audio_path=source_audio_path,
+        params=params,
+        processing_fingerprint=options.processing_fingerprint,
+        audio_fingerprint=source_audio_fingerprint,
+    )
+    loaded_entry = cache_store.load_analysis(
+        cache_key=cache_key,
+        require_preview=options.save_preview,
+        require_playback_audio=options.save_playback_audio,
+    )
+    if loaded_entry is None:
+        return None
+    cache_read_ms = (perf_counter() - stage_start) * 1000.0
+    return AnalyzeExecutionResult(
+        input_path=source_audio_path,
+        effective_params=params,
+        cache_key=cache_key,
+        cache_paths=loaded_entry.paths,
+        cqt_result=loaded_entry.result,
+        num_frames=loaded_entry.result.num_frames,
+        num_bins=loaded_entry.result.num_bins,
+        sample_rate=loaded_entry.result.sample_rate,
+        preview_path=loaded_entry.preview_path if options.save_preview else None,
+        playback_audio_path=loaded_entry.playback_audio_path if options.save_playback_audio else None,
+        timings_ms={
+            "load_audio_ms": 0.0,
+            "mix_channel_ms": 0.0,
+            "compute_cqt_ms": 0.0,
+            "cache_read_ms": cache_read_ms,
+            "cache_write_ms": 0.0,
+            "playback_audio_ms": 0.0,
+            "preview_ms": 0.0,
+            "total_ms": cache_read_ms,
+        },
     )
 
 
@@ -206,7 +378,7 @@ def _execute_analysis_from_loaded_audio(
     precomputed_cqt_ms: float | None = None,
 ) -> tuple[AnalyzeExecutionResult, int]:
     params.validate()
-    timings: dict[str, float] = {"load_audio_ms": float(load_audio_ms)}
+    timings: dict[str, float] = {"load_audio_ms": float(load_audio_ms), "cache_read_ms": 0.0}
     total_start = perf_counter()
 
     effective_params = replace(params, sample_rate=loaded_sample_rate)
@@ -275,6 +447,8 @@ def _execute_analysis_from_loaded_audio(
         completed_steps += 1
         _report_progress(progress_callback, completed_steps, total_steps, f"{mode.display_name} 预览图生成完成", mode)
 
+    persisted_cqt_result = _load_memmap_backed_cqt_result(cache_store, cache_paths, fallback_result=cqt_result)
+
     timings["total_ms"] = load_audio_ms + (perf_counter() - total_start) * 1000.0
 
     return (
@@ -283,9 +457,9 @@ def _execute_analysis_from_loaded_audio(
             effective_params=effective_params,
             cache_key=cache_key,
             cache_paths=cache_paths,
-            cqt_result=cqt_result,
-            num_frames=cqt_result.num_frames,
-            num_bins=cqt_result.num_bins,
+            cqt_result=persisted_cqt_result,
+            num_frames=persisted_cqt_result.num_frames,
+            num_bins=persisted_cqt_result.num_bins,
             sample_rate=loaded_sample_rate,
             preview_path=preview_path,
             playback_audio_path=playback_audio_path,
@@ -325,14 +499,13 @@ def _compute_cqt_for_mode(signal: np.ndarray, sample_rate: int, params: Analysis
     return compute_cqt(signal, sample_rate, params)
 
 
-def _precompute_cqt_results_from_lr(
+def _prepare_shared_cqt_from_lr(
     *,
     audio: np.ndarray,
     sample_rate: int,
     params: AnalysisParams,
-    modes: Iterable[ChannelMode],
-) -> dict[ChannelMode, CqtResult]:
-    """对 1~2 声道音频复用 CQT：只计算 L/R 的 complex CQT，再派生各模式的 magnitude。"""
+) -> _SharedLrCqtState:
+    """对 1~2 声道音频准备共享 CQT：只保留 L/R complex 结果，并按需派生各模式的 magnitude。"""
 
     if audio.ndim != 2:
         raise ValueError("audio 必须是二维数组 (channels, samples)")
@@ -340,8 +513,6 @@ def _precompute_cqt_results_from_lr(
         raise ValueError("audio 至少需要 1 个声道")
     if audio.shape[0] > 2:
         raise ValueError("仅支持对 1~2 声道音频进行共享 CQT 优化")
-
-    requested = set(modes)
 
     left = np.ascontiguousarray(audio[0], dtype=np.float32)
     right_source = audio[1] if audio.shape[0] > 1 else audio[0]
@@ -358,34 +529,26 @@ def _precompute_cqt_results_from_lr(
         params,
     )
 
-    left_magnitude = np.abs(left_complex).T.astype(np.float32)
-    right_magnitude = np.abs(right_complex).T.astype(np.float32)
+    return _SharedLrCqtState(
+        left_complex=left_complex,
+        right_complex=right_complex,
+        frame_times=frame_times,
+        bin_frequencies=bin_frequencies,
+        hop_length=hop_length,
+        sample_rate=int(sample_rate),
+    )
 
-    results: dict[ChannelMode, CqtResult] = {}
 
-    def build_result(magnitude: np.ndarray) -> CqtResult:
-        return CqtResult(
-            magnitude=magnitude,
-            frame_times=frame_times,
-            bin_frequencies=bin_frequencies,
-            hop_length=hop_length,
-            sample_rate=int(sample_rate),
-        )
-
-    if ChannelMode.LEFT in requested:
-        results[ChannelMode.LEFT] = build_result(left_magnitude)
-    if ChannelMode.RIGHT in requested:
-        results[ChannelMode.RIGHT] = build_result(right_magnitude)
-    if ChannelMode.STEREO in requested:
-        results[ChannelMode.STEREO] = build_result(np.maximum(left_magnitude, right_magnitude).astype(np.float32))
-    if ChannelMode.MONO in requested:
-        mono_complex = (left_complex + right_complex) * 0.5
-        results[ChannelMode.MONO] = build_result(np.abs(mono_complex).T.astype(np.float32))
-    if ChannelMode.SIDE in requested:
-        side_complex = left_complex - right_complex
-        results[ChannelMode.SIDE] = build_result(np.abs(side_complex).T.astype(np.float32))
-
-    return results
+def _load_memmap_backed_cqt_result(
+    cache_store: CacheStore,
+    cache_paths: CachePaths,
+    *,
+    fallback_result: CqtResult,
+) -> CqtResult:
+    try:
+        return cache_store.load_cqt_result_from_paths(cache_paths)
+    except Exception:  # noqa: BLE001
+        return fallback_result
 
 
 def _save_playback_audio(signal: np.ndarray, sample_rate: int, output_path: str | Path) -> Path:
