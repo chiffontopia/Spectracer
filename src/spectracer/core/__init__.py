@@ -1,5 +1,13 @@
 """Core domain models and configuration types."""
 
+from spectracer.core.analysis_results import (
+    BeatAnchor,
+    ChordAnalysisResult,
+    ChordSegment,
+    TempoAnalysisCandidate,
+    TempoAnalysisResult,
+    TempoSegment,
+)
 from spectracer.core.config import (
     DEFAULT_ANALYZE_CONFIG_PATH,
     AnalyzeCliConfig,
@@ -26,6 +34,12 @@ __all__ = [
     "AnalysisParams",
     "ChannelMode",
     "CqtResult",
+    "TempoAnalysisCandidate",
+    "BeatAnchor",
+    "TempoSegment",
+    "TempoAnalysisResult",
+    "ChordSegment",
+    "ChordAnalysisResult",
     "frequency_to_midi",
     "frequency_to_note_name",
     "is_black_key",

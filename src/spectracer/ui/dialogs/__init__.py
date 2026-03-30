@@ -9,6 +9,7 @@ from spectracer.ui.dialogs.grid_event_dialog import (
     TimeSignatureEventDialogResult,
 )
 from spectracer.ui.dialogs.grid_settings_dialog import GridSettingsDialog, GridSettingsDialogResult
+from spectracer.ui.dialogs.tempo_analysis_dialog import TempoAnalysisDialog
 from spectracer.ui.dialogs.midi_settings_dialog import MidiSettingsDialog, MidiSettingsDialogResult
 from spectracer.ui.dialogs.midi_note_properties_dialog import (
     MidiNotePropertiesDialog,
@@ -25,6 +26,7 @@ __all__ = [
     "TimeSignatureEventDialogResult",
     "GridSettingsDialog",
     "GridSettingsDialogResult",
+    "TempoAnalysisDialog",
     "MidiSettingsDialog",
     "MidiNotePropertiesDialog",
     "MidiNotePropertiesDialogResult",

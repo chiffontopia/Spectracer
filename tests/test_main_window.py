@@ -8,9 +8,12 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectracer.core.config import AnalyzeCliConfig
+from spectracer.core.analysis_results import TempoAnalysisCandidate
 from spectracer.core.models import ChannelMode
+from spectracer.midi.editor_model import EventTrackLane, EventTrackSelection
+from spectracer.midi.grid import TempoEvent, TempoTransition
 from spectracer.ui import main_window as main_window_module
-from spectracer.ui.main_window import AnalysisWorker, SpectracerMainWindow
+from spectracer.ui.main_window import AnalysisWorker, MidiGridUserSettings, SpectracerMainWindow
 
 
 def test_load_initial_runtime_config_unpacks_runtime_helper_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -245,3 +248,40 @@ def test_on_analysis_failed_closes_progress_dialog_before_reporting_error() -> N
     SpectracerMainWindow._on_analysis_failed(window, "boom")
 
     assert events == ["close", "error:boom", "busy:False"]
+
+
+def test_apply_tempo_candidate_to_grid_updates_root_bpm_offset_and_selection() -> None:
+    class _Label:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _Window:
+        def __init__(self) -> None:
+            self._grid_settings = MidiGridUserSettings(
+                bpm=100.0,
+                offset_ms=10.0,
+                tempo_events=(TempoEvent(0.0, 100.0, TempoTransition.LINEAR), TempoEvent(16.0, 110.0)),
+            )
+            self.persisted_selection = None
+            self.status_message = _Label()
+
+        def _apply_grid_root_bpm_offset(self, *, bpm: float, offset_ms: float) -> None:
+            SpectracerMainWindow._apply_grid_root_bpm_offset(self, bpm=bpm, offset_ms=offset_ms)
+
+        def _persist_grid_settings(self, *, selection=None) -> None:
+            self.persisted_selection = selection
+
+    window = _Window()
+    candidate = TempoAnalysisCandidate(bpm=128.0, first_beat_seconds=0.25, offset_ms=250.0, confidence=0.8)
+
+    SpectracerMainWindow._apply_tempo_candidate_to_grid(window, candidate)
+
+    assert window._grid_settings.bpm == pytest.approx(128.0)
+    assert window._grid_settings.offset_ms == pytest.approx(250.0)
+    assert window._grid_settings.tempo_events[0] == TempoEvent(0.0, 128.0, TempoTransition.LINEAR)
+    assert window._grid_settings.tempo_events[1] == TempoEvent(16.0, 110.0)
+    assert window.persisted_selection == EventTrackSelection(EventTrackLane.TEMPO, 0)
+    assert "已应用节拍候选" in window.status_message.text

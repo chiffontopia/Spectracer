@@ -34,6 +34,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from spectracer.app.analysis_sidecar_workflow import (
+    SidecarAnalysisExecutionOptions,
+    SidecarAnalysisExecutionResult,
+    SidecarAnalysisProgress,
+    execute_tempo_sidecar_analysis,
+)
 from spectracer.app.analysis_workflow import (
     AnalysisProgress,
     AnalyzeExecutionOptions,
@@ -43,6 +49,7 @@ from spectracer.app.analysis_workflow import (
 )
 from spectracer.app.controllers.midi_editor_controller import MidiEditorController
 from spectracer.audio.playback import PlaybackEngine
+from spectracer.core.analysis_results import TempoAnalysisCandidate, TempoAnalysisResult
 from spectracer.core.config import AnalyzeCliConfig, load_runtime_analyze_config
 from spectracer.core.models import AnalysisParams, ChannelMode
 from spectracer.core.pitch import frequency_to_midi
@@ -61,6 +68,7 @@ from spectracer.midi.playback_controller import MidiPlaybackController
 from spectracer.midi.session import MidiSession
 from spectracer.midi.synth import DEFAULT_GAIN, MidiSynth, create_default_midi_synth
 from spectracer.dsp.colormap import ColorStop, default_spectracer_colormap_stops, normalize_colormap_stops
+from spectracer.dsp.tempo_analysis import analyze_tempo_candidates
 from spectracer.dsp.visualization import NormalizationMode
 from spectracer.project.cache_store import CacheStore
 from spectracer.ui.dialogs.analysis_options_dialog import AnalysisOptionsDialog
@@ -70,6 +78,7 @@ from spectracer.ui.dialogs.grid_settings_dialog import GridSettingsDialog
 from spectracer.ui.overlays.event_track_widget import EventTrackLaneLabels, GridEventTrackWidget
 from spectracer.ui.dialogs.midi_settings_dialog import MidiSettingsDialog
 from spectracer.ui.dialogs.colormap_editor_dialog import ColormapEditorDialog
+from spectracer.ui.dialogs.tempo_analysis_dialog import TempoAnalysisDialog
 from spectracer.ui.views.spectrogram_view import HoverInfo, SpectrogramView, ViewState
 from spectracer.ui.widgets.piano_keyboard import PianoKeyboardWidget
 
@@ -270,6 +279,51 @@ class AnalysisWorker(QObject):
         self.mode_ready.emit(mode, result)
 
 
+
+class TempoSidecarWorker(QObject):
+    progress_changed = pyqtSignal(object)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    completed = pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        source_audio_path: Path,
+        cache_dir: Path,
+        cache_key: str,
+        channel_mode: ChannelMode,
+        force_recompute: bool = False,
+    ) -> None:
+        super().__init__()
+        self._source_audio_path = source_audio_path
+        self._cache_dir = cache_dir
+        self._cache_key = cache_key
+        self._channel_mode = channel_mode
+        self._force_recompute = bool(force_recompute)
+
+    def run(self) -> None:
+        try:
+            cache_store = CacheStore(self._cache_dir)
+            result = execute_tempo_sidecar_analysis(
+                source_audio_path=self._source_audio_path,
+                cache_store=cache_store,
+                cache_key=self._cache_key,
+                channel_mode=self._channel_mode,
+                analyzer=analyze_tempo_candidates,
+                options=SidecarAnalysisExecutionOptions(force_recompute=self._force_recompute),
+                progress_callback=self._handle_progress,
+            )
+            self.finished.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        finally:
+            self.completed.emit()
+
+    def _handle_progress(self, progress: SidecarAnalysisProgress) -> None:
+        self.progress_changed.emit(progress)
+
+
 class SpectracerMainWindow(QMainWindow):
     def __init__(self, initial_audio_path: str | Path | None = None) -> None:
         super().__init__()
@@ -292,6 +346,9 @@ class SpectracerMainWindow(QMainWindow):
         self._updating_scrollbars = False
         self._analysis_thread: QThread | None = None
         self._analysis_worker: AnalysisWorker | None = None
+        self._tempo_analysis_thread: QThread | None = None
+        self._tempo_analysis_worker: TempoSidecarWorker | None = None
+        self._tempo_analysis_dialog: TempoAnalysisDialog | None = None
         self._progress_dialog: QProgressDialog | None = None
         self._display_sensitivity = self._runtime_config.sensitivity
         self._display_contrast = self._runtime_config.contrast
@@ -411,6 +468,7 @@ class SpectracerMainWindow(QMainWindow):
         self.export_midi_action = QAction("导出 MIDI...", self)
         self.midi_settings_action = QAction("MIDI...", self)
         self.grid_settings_action = QAction("网格...", self)
+        self.tempo_analysis_action = QAction("节拍...", self)
         self.cache_disabled_action = QAction("无缓存模式", self)
         self.cache_disabled_action.setCheckable(True)
         self.cache_disabled_action.setChecked(self._cache_disabled)
@@ -468,6 +526,7 @@ class SpectracerMainWindow(QMainWindow):
         self.main_toolbar.addAction(self.colormap_action)
         self.main_toolbar.addAction(self.midi_settings_action)
         self.main_toolbar.addAction(self.grid_settings_action)
+        self.main_toolbar.addAction(self.tempo_analysis_action)
         self.main_toolbar.addAction(self.grid_toggle_action)
         self.main_toolbar.addAction(self.event_track_toggle_action)
         self.main_toolbar.addSeparator()
@@ -749,6 +808,7 @@ class SpectracerMainWindow(QMainWindow):
         self.cache_disabled_action.toggled.connect(self._on_cache_disabled_toggled)
         self.clear_cache_action.triggered.connect(self._cleanup_unused_analysis_cache)
         self.grid_settings_action.triggered.connect(self._open_grid_settings_dialog)
+        self.tempo_analysis_action.triggered.connect(self._open_tempo_analysis_dialog)
         self.grid_toggle_action.toggled.connect(self._on_grid_visibility_toggled)
         self.event_track_toggle_action.toggled.connect(self._on_event_track_visibility_toggled)
         self.event_snap_checkbox.toggled.connect(self._on_event_snap_toggled)
@@ -1177,6 +1237,138 @@ class SpectracerMainWindow(QMainWindow):
         self.midi_mix_slider.blockSignals(False)
         self.midi_mix_value_label.setText(self._format_percent_label(self._midi_playback_controller.midi_gain))
 
+
+    def _open_tempo_analysis_dialog(self) -> None:
+        if self._current_result is None or self._current_channel_mode is None:
+            self._show_error("请先加载音频，再进行节拍分析。")
+            return
+
+        duration_seconds = float(self._current_result.cqt_result.duration_seconds)
+        current_position = max(0.0, min(float(self.playback_engine.state.position_seconds), duration_seconds))
+        root_signature = (
+            self._grid_settings.time_signature_events[0].time_signature
+            if self._grid_settings.time_signature_events
+            else TimeSignature(self._grid_settings.numerator, self._grid_settings.denominator)
+        )
+        bar_beats = max(1.0, float(root_signature.bar_length_beats))
+        bar_duration_seconds = (60.0 * bar_beats) / max(1.0, float(self._grid_settings.bpm))
+        default_end = min(duration_seconds, current_position + max(0.5, bar_duration_seconds))
+        if default_end <= current_position:
+            default_end = min(duration_seconds, current_position + max(1.0, 60.0 / max(1.0, float(self._grid_settings.bpm))))
+
+        tap_anchor_seconds = max(0.0, float(self._grid_settings.offset_ms) / 1000.0)
+        if tap_anchor_seconds > duration_seconds:
+            tap_anchor_seconds = current_position
+
+        dialog = TempoAnalysisDialog(
+            current_bpm=self._grid_settings.bpm,
+            current_offset_ms=self._grid_settings.offset_ms,
+            current_channel_mode=self._current_channel_mode,
+            duration_seconds=duration_seconds,
+            default_tap_first_beat_seconds=tap_anchor_seconds,
+            default_interval_start_seconds=current_position,
+            default_interval_end_seconds=default_end,
+            default_interval_beats=bar_beats,
+            parent=self,
+        )
+        dialog.apply_candidate_requested.connect(self._apply_tempo_candidate_to_grid)
+        dialog.jump_to_first_beat_requested.connect(self._seek_to_seconds)
+        dialog.smart_analysis_requested.connect(self._request_tempo_sidecar_analysis)
+
+        cached_result = self._load_cached_tempo_analysis()
+        if cached_result is not None:
+            dialog.set_smart_analysis_result(cached_result, from_cache=True)
+
+        self._tempo_analysis_dialog = dialog
+        dialog.exec()
+        if self._tempo_analysis_dialog is dialog and self._tempo_analysis_worker is None:
+            self._tempo_analysis_dialog = None
+
+    def _load_cached_tempo_analysis(self) -> TempoAnalysisResult | None:
+        if self._current_result is None:
+            return None
+        cache_store = CacheStore(self._current_result.cache_paths.root.parent)
+        return cache_store.load_tempo_analysis(cache_key=self._current_result.cache_key)
+
+    def _request_tempo_sidecar_analysis(self) -> None:
+        if self._current_result is None or self._current_channel_mode is None or self._tempo_analysis_dialog is None:
+            return
+        if self._tempo_analysis_worker is not None:
+            return
+
+        dialog = self._tempo_analysis_dialog
+        dialog.set_smart_analysis_busy(True, message="正在检查 / 计算节拍候选…")
+
+        self._tempo_analysis_thread = QThread(self)
+        self._tempo_analysis_worker = TempoSidecarWorker(
+            source_audio_path=self._current_result.input_path,
+            cache_dir=self._current_result.cache_paths.root.parent,
+            cache_key=self._current_result.cache_key,
+            channel_mode=self._current_channel_mode,
+        )
+        self._tempo_analysis_worker.moveToThread(self._tempo_analysis_thread)
+        self._tempo_analysis_thread.started.connect(self._tempo_analysis_worker.run)
+        self._tempo_analysis_worker.progress_changed.connect(self._on_tempo_sidecar_progress_changed)
+        self._tempo_analysis_worker.finished.connect(self._on_tempo_sidecar_finished)
+        self._tempo_analysis_worker.failed.connect(self._on_tempo_sidecar_failed)
+        self._tempo_analysis_worker.completed.connect(self._on_tempo_sidecar_completed)
+        self._tempo_analysis_worker.completed.connect(self._tempo_analysis_thread.quit)
+        self._tempo_analysis_thread.finished.connect(self._tempo_analysis_worker.deleteLater)
+        self._tempo_analysis_thread.finished.connect(self._tempo_analysis_thread.deleteLater)
+        self._tempo_analysis_thread.start()
+
+    def _on_tempo_sidecar_progress_changed(self, progress: SidecarAnalysisProgress) -> None:
+        if self._tempo_analysis_dialog is not None:
+            self._tempo_analysis_dialog.set_smart_analysis_busy(True, message=str(progress.message))
+
+    def _on_tempo_sidecar_finished(self, execution_result: SidecarAnalysisExecutionResult) -> None:
+        if self._tempo_analysis_dialog is not None:
+            self._tempo_analysis_dialog.set_smart_analysis_result(
+                execution_result.payload,
+                from_cache=execution_result.from_cache,
+            )
+        source_label = "缓存" if execution_result.from_cache else "计算"
+        self.status_message.setText(f"节拍分析完成（{source_label}）")
+
+    def _on_tempo_sidecar_failed(self, message: str) -> None:
+        if self._tempo_analysis_dialog is not None:
+            self._tempo_analysis_dialog.set_smart_analysis_busy(False, message=f"节拍分析失败：{message}")
+        self._show_error(message)
+
+    def _on_tempo_sidecar_completed(self) -> None:
+        if self._tempo_analysis_thread is not None:
+            self._tempo_analysis_thread = None
+        self._tempo_analysis_worker = None
+        if self._tempo_analysis_dialog is not None and not self._tempo_analysis_dialog.isVisible():
+            self._tempo_analysis_dialog = None
+
+    def _apply_grid_root_bpm_offset(self, *, bpm: float, offset_ms: float) -> None:
+        self._grid_settings.bpm = max(1.0, float(bpm))
+        self._grid_settings.offset_ms = float(offset_ms)
+        root_transition = self._grid_settings.tempo_events[0].transition if self._grid_settings.tempo_events else TempoTransition.STEP
+        remaining_tempo_events = self._grid_settings.tempo_events[1:] if len(self._grid_settings.tempo_events) > 1 else ()
+        self._grid_settings.tempo_events = (TempoEvent(0.0, self._grid_settings.bpm, root_transition), *remaining_tempo_events)
+
+    def _apply_grid_root_time_signature(self, *, numerator: int, denominator: int) -> None:
+        self._grid_settings.numerator = int(numerator)
+        self._grid_settings.denominator = int(denominator)
+        remaining_signature_events = (
+            self._grid_settings.time_signature_events[1:]
+            if len(self._grid_settings.time_signature_events) > 1
+            else ()
+        )
+        root_signature = TimeSignature(self._grid_settings.numerator, self._grid_settings.denominator)
+        self._grid_settings.time_signature_events = (TimeSignatureEvent(0.0, root_signature), *remaining_signature_events)
+
+    def _apply_tempo_candidate_to_grid(self, candidate: object) -> None:
+        if not isinstance(candidate, TempoAnalysisCandidate):
+            return
+        self._apply_grid_root_bpm_offset(bpm=candidate.bpm, offset_ms=candidate.offset_ms)
+        self._persist_grid_settings(selection=EventTrackSelection(EventTrackLane.TEMPO, 0))
+        self.status_message.setText(
+            f"已应用节拍候选：{candidate.bpm:.3f} BPM | 首拍 {candidate.first_beat_seconds:.3f} s | offset {candidate.offset_ms:+.1f} ms"
+        )
+
     def _open_grid_settings_dialog(self) -> None:
         dialog = GridSettingsDialog(
             initial_bpm=self._grid_settings.bpm,
@@ -1191,19 +1383,12 @@ class SpectracerMainWindow(QMainWindow):
             return
 
         selected = dialog.selected_settings()
-        self._grid_settings.bpm = float(selected.bpm)
-        self._grid_settings.numerator = int(selected.numerator)
-        self._grid_settings.denominator = int(selected.denominator)
-        self._grid_settings.offset_ms = float(selected.offset_ms)
         self._grid_settings.subdivisions_per_beat = int(selected.subdivisions_per_beat)
-
-        first_tempo_transition = self._grid_settings.tempo_events[0].transition if self._grid_settings.tempo_events else TempoTransition.STEP
-        remaining_tempo_events = self._grid_settings.tempo_events[1:] if len(self._grid_settings.tempo_events) > 1 else ()
-        self._grid_settings.tempo_events = (TempoEvent(0.0, self._grid_settings.bpm, first_tempo_transition), *remaining_tempo_events)
-
-        remaining_signature_events = self._grid_settings.time_signature_events[1:] if len(self._grid_settings.time_signature_events) > 1 else ()
-        root_signature = TimeSignature(self._grid_settings.numerator, self._grid_settings.denominator)
-        self._grid_settings.time_signature_events = (TimeSignatureEvent(0.0, root_signature), *remaining_signature_events)
+        self._apply_grid_root_bpm_offset(bpm=float(selected.bpm), offset_ms=float(selected.offset_ms))
+        self._apply_grid_root_time_signature(
+            numerator=int(selected.numerator),
+            denominator=int(selected.denominator),
+        )
         self._persist_grid_settings()
 
     def _on_grid_visibility_toggled(self, enabled: bool) -> None:
@@ -2231,6 +2416,7 @@ class SpectracerMainWindow(QMainWindow):
         self.play_button.setEnabled(interactive_ready and has_audio)
         self.transport_slider.setEnabled(interactive_ready and has_audio)
         self.channel_mode_combo.setEnabled(interactive_ready and len(self._channel_results) > 1)
+        self.tempo_analysis_action.setEnabled(interactive_ready and has_audio)
 
     def _set_display_controls(self, sensitivity: float, contrast: float, *, apply_to_view: bool = True) -> None:
         sensitivity_value = max(0.1, min(4.0, float(sensitivity)))
@@ -2284,6 +2470,10 @@ class SpectracerMainWindow(QMainWindow):
             pass
 
         self._midi_editor_controller.close()
+        if self._tempo_analysis_thread is not None and self._tempo_analysis_thread.isRunning():
+            self._tempo_analysis_thread.quit()
+            self._tempo_analysis_thread.wait(1000)
+
         self._midi_playback_controller.close()
         self.midi_synth.close()
         self._cleanup_transient_analysis_cache_dir()

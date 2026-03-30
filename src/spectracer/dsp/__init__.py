@@ -5,4 +5,5 @@ __all__ = [
     "processing",
     "visualization",
     "colormap",
+    "tempo_analysis",
 ]

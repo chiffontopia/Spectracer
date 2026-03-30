@@ -6,11 +6,14 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 
+from spectracer.core.analysis_results import ChordAnalysisResult, TempoAnalysisResult
 from spectracer.core.models import AnalysisParams, CqtResult
+
+_SidecarT = TypeVar("_SidecarT", TempoAnalysisResult, ChordAnalysisResult)
 
 
 @dataclass(slots=True)
@@ -22,6 +25,8 @@ class CachePaths:
     metadata: Path
     preview: Path
     playback_audio: Path
+    tempo_analysis: Path
+    chord_analysis: Path
 
 
 @dataclass(slots=True)
@@ -32,6 +37,8 @@ class LoadedCacheEntry:
     metadata: dict[str, Any]
     preview_path: Path | None
     playback_audio_path: Path | None
+    tempo_analysis_path: Path | None
+    chord_analysis_path: Path | None
 
 
 @dataclass(slots=True)
@@ -64,6 +71,8 @@ class CacheStore:
             metadata=root / "meta.json",
             preview=root / "preview.png",
             playback_audio=root / "playback.wav",
+            tempo_analysis=root / "tempo_analysis.json",
+            chord_analysis=root / "chord_analysis.json",
         )
 
     def build_cache_key(
@@ -109,6 +118,8 @@ class CacheStore:
             metadata=metadata,
             preview_path=resolved_paths.preview if resolved_paths.preview.exists() else None,
             playback_audio_path=resolved_paths.playback_audio if resolved_paths.playback_audio.exists() else None,
+            tempo_analysis_path=resolved_paths.tempo_analysis if resolved_paths.tempo_analysis.exists() else None,
+            chord_analysis_path=resolved_paths.chord_analysis if resolved_paths.chord_analysis.exists() else None,
         )
 
     def save_analysis(
@@ -147,6 +158,8 @@ class CacheStore:
                 "bin_frequencies": paths.bin_frequencies.name,
                 "preview": paths.preview.name,
                 "playback_audio": paths.playback_audio.name,
+                "tempo_analysis": paths.tempo_analysis.name,
+                "chord_analysis": paths.chord_analysis.name,
             },
         }
         paths.metadata.write_text(
@@ -155,6 +168,18 @@ class CacheStore:
         )
 
         return paths
+
+    def load_tempo_analysis(self, *, cache_key: str) -> TempoAnalysisResult | None:
+        return self._load_sidecar(self.paths_for(cache_key).tempo_analysis, TempoAnalysisResult.from_dict)
+
+    def save_tempo_analysis(self, *, cache_key: str, result: TempoAnalysisResult) -> Path:
+        return self._save_sidecar(self.paths_for(cache_key).tempo_analysis, result.to_dict())
+
+    def load_chord_analysis(self, *, cache_key: str) -> ChordAnalysisResult | None:
+        return self._load_sidecar(self.paths_for(cache_key).chord_analysis, ChordAnalysisResult.from_dict)
+
+    def save_chord_analysis(self, *, cache_key: str, result: ChordAnalysisResult) -> Path:
+        return self._save_sidecar(self.paths_for(cache_key).chord_analysis, result.to_dict())
 
     def cleanup_unused(self, *, exclude_cache_keys: set[str] | None = None) -> CacheCleanupResult:
         excluded = set() if exclude_cache_keys is None else {str(cache_key) for cache_key in exclude_cache_keys}
@@ -196,6 +221,8 @@ class CacheStore:
             metadata=root / str(files.get("metadata", "meta.json")),
             preview=root / str(files.get("preview", "preview.png")),
             playback_audio=root / str(files.get("playback_audio", "playback.wav")),
+            tempo_analysis=root / str(files.get("tempo_analysis", "tempo_analysis.json")),
+            chord_analysis=root / str(files.get("chord_analysis", "chord_analysis.json")),
         )
 
     def _is_cache_entry_complete(
@@ -233,6 +260,25 @@ class CacheStore:
             hop_length=hop_length,
             sample_rate=sample_rate,
         )
+
+    def _load_sidecar(self, path: Path, parser: Callable[[dict[str, Any]], _SidecarT]) -> _SidecarT | None:
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return parser(payload)
+        except (TypeError, ValueError):
+            return None
+
+    def _save_sidecar(self, path: Path, payload: dict[str, Any]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
 
 def _directory_size_bytes(root: Path) -> int:
