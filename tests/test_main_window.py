@@ -285,3 +285,45 @@ def test_apply_tempo_candidate_to_grid_updates_root_bpm_offset_and_selection() -
     assert window._grid_settings.tempo_events[1] == TempoEvent(16.0, 110.0)
     assert window.persisted_selection == EventTrackSelection(EventTrackLane.TEMPO, 0)
     assert "已应用节拍候选" in window.status_message.text
+
+
+def test_apply_tempo_candidate_to_grid_preserves_existing_offset_for_bpm_only_candidate() -> None:
+    class _Label:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _Window:
+        def __init__(self) -> None:
+            self._grid_settings = MidiGridUserSettings(
+                bpm=100.0,
+                offset_ms=42.0,
+                tempo_events=(TempoEvent(0.0, 100.0),),
+            )
+            self.persisted_selection = None
+            self.status_message = _Label()
+
+        def _apply_grid_root_bpm_offset(self, *, bpm: float, offset_ms: float) -> None:
+            SpectracerMainWindow._apply_grid_root_bpm_offset(self, bpm=bpm, offset_ms=offset_ms)
+
+        def _persist_grid_settings(self, *, selection=None) -> None:
+            self.persisted_selection = selection
+
+    window = _Window()
+    candidate = TempoAnalysisCandidate(
+        bpm=128.0,
+        first_beat_seconds=0.5,
+        offset_ms=0.0,
+        confidence=0.8,
+        applies_offset=False,
+    )
+
+    SpectracerMainWindow._apply_tempo_candidate_to_grid(window, candidate)
+
+    assert window._grid_settings.bpm == pytest.approx(128.0)
+    assert window._grid_settings.offset_ms == pytest.approx(42.0)
+    assert window._grid_settings.tempo_events[0] == TempoEvent(0.0, 128.0, TempoTransition.STEP)
+    assert window.persisted_selection == EventTrackSelection(EventTrackLane.TEMPO, 0)
+    assert "保留当前 offset" in window.status_message.text

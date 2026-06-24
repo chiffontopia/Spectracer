@@ -10,10 +10,10 @@ from typing import Any, Callable, TypeVar
 
 import numpy as np
 
-from spectracer.core.analysis_results import ChordAnalysisResult, TempoAnalysisResult
+from spectracer.core.analysis_results import TempoAnalysisResult
 from spectracer.core.models import AnalysisParams, CqtResult
 
-_SidecarT = TypeVar("_SidecarT", TempoAnalysisResult, ChordAnalysisResult)
+_LoadedT = TypeVar("_LoadedT")
 
 
 @dataclass(slots=True)
@@ -26,7 +26,6 @@ class CachePaths:
     preview: Path
     playback_audio: Path
     tempo_analysis: Path
-    chord_analysis: Path
 
 
 @dataclass(slots=True)
@@ -38,7 +37,6 @@ class LoadedCacheEntry:
     preview_path: Path | None
     playback_audio_path: Path | None
     tempo_analysis_path: Path | None
-    chord_analysis_path: Path | None
 
 
 @dataclass(slots=True)
@@ -72,7 +70,6 @@ class CacheStore:
             preview=root / "preview.png",
             playback_audio=root / "playback.wav",
             tempo_analysis=root / "tempo_analysis.json",
-            chord_analysis=root / "chord_analysis.json",
         )
 
     def build_cache_key(
@@ -119,7 +116,6 @@ class CacheStore:
             preview_path=resolved_paths.preview if resolved_paths.preview.exists() else None,
             playback_audio_path=resolved_paths.playback_audio if resolved_paths.playback_audio.exists() else None,
             tempo_analysis_path=resolved_paths.tempo_analysis if resolved_paths.tempo_analysis.exists() else None,
-            chord_analysis_path=resolved_paths.chord_analysis if resolved_paths.chord_analysis.exists() else None,
         )
 
     def save_analysis(
@@ -159,7 +155,6 @@ class CacheStore:
                 "preview": paths.preview.name,
                 "playback_audio": paths.playback_audio.name,
                 "tempo_analysis": paths.tempo_analysis.name,
-                "chord_analysis": paths.chord_analysis.name,
             },
         }
         paths.metadata.write_text(
@@ -174,12 +169,6 @@ class CacheStore:
 
     def save_tempo_analysis(self, *, cache_key: str, result: TempoAnalysisResult) -> Path:
         return self._save_sidecar(self.paths_for(cache_key).tempo_analysis, result.to_dict())
-
-    def load_chord_analysis(self, *, cache_key: str) -> ChordAnalysisResult | None:
-        return self._load_sidecar(self.paths_for(cache_key).chord_analysis, ChordAnalysisResult.from_dict)
-
-    def save_chord_analysis(self, *, cache_key: str, result: ChordAnalysisResult) -> Path:
-        return self._save_sidecar(self.paths_for(cache_key).chord_analysis, result.to_dict())
 
     def cleanup_unused(self, *, exclude_cache_keys: set[str] | None = None) -> CacheCleanupResult:
         excluded = set() if exclude_cache_keys is None else {str(cache_key) for cache_key in exclude_cache_keys}
@@ -222,7 +211,6 @@ class CacheStore:
             preview=root / str(files.get("preview", "preview.png")),
             playback_audio=root / str(files.get("playback_audio", "playback.wav")),
             tempo_analysis=root / str(files.get("tempo_analysis", "tempo_analysis.json")),
-            chord_analysis=root / str(files.get("chord_analysis", "chord_analysis.json")),
         )
 
     def _is_cache_entry_complete(
@@ -261,7 +249,7 @@ class CacheStore:
             sample_rate=sample_rate,
         )
 
-    def _load_sidecar(self, path: Path, parser: Callable[[dict[str, Any]], _SidecarT]) -> _SidecarT | None:
+    def _load_sidecar(self, path: Path, parser: Callable[[dict[str, Any]], _LoadedT]) -> _LoadedT | None:
         if not path.exists():
             return None
         try:

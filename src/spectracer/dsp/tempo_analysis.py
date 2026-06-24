@@ -86,10 +86,11 @@ def analyze_tempo_candidates(
             TempoAnalysisCandidate(
                 bpm=float(candidate.bpm),
                 first_beat_seconds=float(candidate.first_beat_seconds),
-                offset_ms=float(candidate.first_beat_seconds * 1000.0),
+                offset_ms=0.0,
                 confidence=float(_clamp01(candidate.raw_score)),
                 candidate_rank=index,
                 label=label,
+                applies_offset=False,
             )
         )
 
@@ -136,7 +137,7 @@ def _collect_scored_candidates(
             start_bpm=float(seed_bpm),
             units="time",
         )
-        bpm = float(np.ravel(np.asarray(tempo_estimate, dtype=np.float64))[0])
+        bpm = _normalize_candidate_bpm(np.ravel(np.asarray(tempo_estimate, dtype=np.float64))[0])
         if not math.isfinite(bpm) or bpm < MIN_TEMPO_CANDIDATE_BPM or bpm > MAX_TEMPO_CANDIDATE_BPM:
             continue
 
@@ -173,10 +174,10 @@ def _build_fallback_candidate(
     duration_seconds: float,
 ) -> _ScoredTempoCandidate:
     tempo_estimate = librosa.feature.tempo(onset_envelope=onset_envelope, sr=sample_rate, aggregate=np.median)
-    bpm = float(np.ravel(np.asarray(tempo_estimate, dtype=np.float64))[0]) if np.size(tempo_estimate) else 120.0
+    bpm = _normalize_candidate_bpm(np.ravel(np.asarray(tempo_estimate, dtype=np.float64))[0]) if np.size(tempo_estimate) else 120.0
     if not math.isfinite(bpm) or bpm <= 0.0:
         bpm = 120.0
-    bpm = min(MAX_TEMPO_CANDIDATE_BPM, max(MIN_TEMPO_CANDIDATE_BPM, bpm))
+    bpm = _normalize_candidate_bpm(min(MAX_TEMPO_CANDIDATE_BPM, max(MIN_TEMPO_CANDIDATE_BPM, bpm)))
     first_beat_seconds = _fallback_first_beat(onset_times)
     precision, recall, raw_score = _score_candidate(
         onset_envelope=onset_envelope,
@@ -301,6 +302,14 @@ def _fallback_first_beat(onset_times: np.ndarray) -> float:
     if onset_times.size == 0:
         return 0.0
     return float(onset_times[0])
+
+
+def _normalize_candidate_bpm(value: float) -> float:
+    bpm = float(value)
+    if not math.isfinite(bpm):
+        return bpm
+    bpm = min(MAX_TEMPO_CANDIDATE_BPM, max(MIN_TEMPO_CANDIDATE_BPM, bpm))
+    return float(max(1, int(round(bpm))))
 
 
 def _label_for_candidate(*, primary_bpm: float, bpm: float, rank: int) -> str:

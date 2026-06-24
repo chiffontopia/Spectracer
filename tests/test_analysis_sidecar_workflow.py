@@ -8,15 +8,9 @@ import numpy as np
 from spectracer.app.analysis_sidecar_workflow import (
     AnalysisSidecarKind,
     SidecarAnalysisExecutionOptions,
-    execute_chord_sidecar_analysis,
     execute_tempo_sidecar_analysis,
 )
-from spectracer.core.analysis_results import (
-    ChordAnalysisResult,
-    ChordSegment,
-    TempoAnalysisCandidate,
-    TempoAnalysisResult,
-)
+from spectracer.core.analysis_results import TempoAnalysisCandidate, TempoAnalysisResult
 from spectracer.core.models import AnalysisParams, ChannelMode, CqtResult
 from spectracer.project.cache_store import CacheStore
 
@@ -58,7 +52,7 @@ def _create_analysis_cache(tmp_path: Path, sample_wav_path: Path) -> tuple[Cache
     return cache_store, cache_key
 
 
-def test_cache_store_persists_analysis_sidecars_and_registers_default_paths(
+def test_cache_store_persists_tempo_sidecar_and_registers_default_paths(
     tmp_path: Path,
     sample_wav_path: Path,
 ) -> None:
@@ -76,24 +70,17 @@ def test_cache_store_persists_analysis_sidecars_and_registers_default_paths(
             ),
         ),
     )
-    chord_result = ChordAnalysisResult(
-        channel_mode=ChannelMode.MONO,
-        segments=(ChordSegment(start_seconds=0.0, end_seconds=1.0, label="C", confidence=0.88),),
-    )
 
     tempo_path = cache_store.save_tempo_analysis(cache_key=cache_key, result=tempo_result)
-    chord_path = cache_store.save_chord_analysis(cache_key=cache_key, result=chord_result)
     loaded_entry = cache_store.load_analysis(cache_key=cache_key)
 
     assert loaded_entry is not None
     assert loaded_entry.tempo_analysis_path == tempo_path
-    assert loaded_entry.chord_analysis_path == chord_path
     assert cache_store.load_tempo_analysis(cache_key=cache_key) == tempo_result
-    assert cache_store.load_chord_analysis(cache_key=cache_key) == chord_result
 
     metadata = json.loads(loaded_entry.paths.metadata.read_text(encoding="utf-8"))
     assert metadata["files"]["tempo_analysis"] == "tempo_analysis.json"
-    assert metadata["files"]["chord_analysis"] == "chord_analysis.json"
+    assert "chord_analysis" not in metadata["files"]
 
 
 def test_execute_tempo_sidecar_analysis_reuses_cached_sidecar(
@@ -143,39 +130,48 @@ def test_execute_tempo_sidecar_analysis_reuses_cached_sidecar(
     assert (AnalysisSidecarKind.TEMPO, "persist") in progress_stages
 
 
-def test_execute_chord_sidecar_analysis_force_recompute_bypasses_existing_cache(
+def test_execute_tempo_sidecar_analysis_force_recompute_bypasses_existing_cache(
     tmp_path: Path,
     sample_wav_path: Path,
 ) -> None:
     cache_store, cache_key = _create_analysis_cache(tmp_path, sample_wav_path)
     call_count = 0
 
-    def _chord_analyzer(_audio_path: Path, channel_mode: ChannelMode) -> ChordAnalysisResult:
+    def _tempo_analyzer(_audio_path: Path, channel_mode: ChannelMode) -> TempoAnalysisResult:
         nonlocal call_count
         call_count += 1
-        return ChordAnalysisResult(
+        return TempoAnalysisResult(
             channel_mode=channel_mode,
-            segments=(ChordSegment(start_seconds=0.0, end_seconds=1.0, label=f"C#{call_count}", confidence=0.6),),
+            candidates=(
+                TempoAnalysisCandidate(
+                    bpm=120.0 + call_count,
+                    first_beat_seconds=0.0,
+                    offset_ms=0.0,
+                    confidence=0.6,
+                    candidate_rank=1,
+                    label=f"take-{call_count}",
+                ),
+            ),
         )
 
-    first = execute_chord_sidecar_analysis(
+    first = execute_tempo_sidecar_analysis(
         source_audio_path=sample_wav_path,
         cache_store=cache_store,
         cache_key=cache_key,
         channel_mode=ChannelMode.RIGHT,
-        analyzer=_chord_analyzer,
+        analyzer=_tempo_analyzer,
     )
-    second = execute_chord_sidecar_analysis(
+    second = execute_tempo_sidecar_analysis(
         source_audio_path=sample_wav_path,
         cache_store=cache_store,
         cache_key=cache_key,
         channel_mode=ChannelMode.RIGHT,
-        analyzer=_chord_analyzer,
+        analyzer=_tempo_analyzer,
         options=SidecarAnalysisExecutionOptions(force_recompute=True),
     )
 
     assert call_count == 2
     assert first.from_cache is False
     assert second.from_cache is False
-    assert first.payload.segments[0].label == "C#1"
-    assert second.payload.segments[0].label == "C#2"
+    assert first.payload.candidates[0].label == "take-1"
+    assert second.payload.candidates[0].label == "take-2"

@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QApplication
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectracer.core.config import AnalyzeCliConfig
-from spectracer.core.models import CqtResult
+from spectracer.core.models import ChannelMode, CqtResult
 from spectracer.midi.editor_model import MidiChannelConfig, MidiEditorTool, MidiNote
 from spectracer.ui import main_window as main_window_module
 from spectracer.ui.main_window import SpectracerMainWindow
@@ -391,6 +391,37 @@ def test_main_window_editor_shortcuts_and_session_signals_keep_controls_in_sync(
     assert window.editor_snap_resolution_combo.currentData() == "1/32"
     assert window.editor_darken_slider.value() == 42
     assert "Lead Synth" in window.editor_active_channel_combo.currentText()
+
+    window.close()
+
+
+def test_main_window_playback_tap_shortcut_auto_applies_bpm_and_preserves_offset(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+) -> None:
+    settings_store: dict[str, object] = {}
+    _patch_main_window_environment(monkeypatch, settings_store)
+
+    window = SpectracerMainWindow()
+    window.show()
+    window._current_result = object()
+    window._current_channel_mode = ChannelMode.MONO
+    window._grid_settings.bpm = 96.0
+    window._grid_settings.offset_ms = 37.5
+    window._apply_grid_root_bpm_offset(bpm=96.0, offset_ms=37.5)
+    window._persist_grid_settings()
+    window._set_playback_rate(0.5)
+    window.playback_engine.play()
+    qapp.processEvents()
+
+    window._record_playback_tap_tempo_shortcut(timestamp_seconds=0.0)
+    window._record_playback_tap_tempo_shortcut(timestamp_seconds=1.0)
+    window._record_playback_tap_tempo_shortcut(timestamp_seconds=2.0)
+
+    assert window._grid_settings.bpm == pytest.approx(120.0)
+    assert window._grid_settings.offset_ms == pytest.approx(37.5)
+    assert window._grid_settings.tempo_events[0].bpm == pytest.approx(120.0)
+    assert "快捷 Tap" in window.status_message.text()
 
     window.close()
 

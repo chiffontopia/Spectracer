@@ -78,7 +78,7 @@ from spectracer.ui.dialogs.grid_settings_dialog import GridSettingsDialog
 from spectracer.ui.overlays.event_track_widget import EventTrackLaneLabels, GridEventTrackWidget
 from spectracer.ui.dialogs.midi_settings_dialog import MidiSettingsDialog
 from spectracer.ui.dialogs.colormap_editor_dialog import ColormapEditorDialog
-from spectracer.ui.dialogs.tempo_analysis_dialog import TempoAnalysisDialog
+from spectracer.ui.dialogs.tempo_analysis_dialog import TapTempoTracker, TempoAnalysisDialog
 from spectracer.ui.views.spectrogram_view import HoverInfo, SpectrogramView, ViewState
 from spectracer.ui.widgets.piano_keyboard import PianoKeyboardWidget
 
@@ -97,6 +97,13 @@ FRACTION_SLIDER_RANGE = 100
 
 def _default_grid_tempo_events() -> tuple[TempoEvent, ...]:
     return (TempoEvent(0.0, 120.0),)
+
+
+def _format_bpm_value(value: float) -> str:
+    bpm = float(value)
+    if bpm.is_integer():
+        return f"{bpm:.0f}"
+    return f"{bpm:.3f}"
 
 
 def _default_grid_time_signature_events() -> tuple[TimeSignatureEvent, ...]:
@@ -383,6 +390,7 @@ class SpectracerMainWindow(QMainWindow):
 
         self._suppress_view_state_persist = False
         self._playback_rate = 1.0
+        self._shortcut_tap_tracker = TapTempoTracker()
 
         self.playback_engine = PlaybackEngine(self)
         self.midi_synth: MidiSynth = create_default_midi_synth(
@@ -553,6 +561,8 @@ class SpectracerMainWindow(QMainWindow):
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.space_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.shift_space_tap_shortcut = QShortcut(QKeySequence("Shift+Space"), self)
+        self.shift_space_tap_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
 
         self.edit_mode_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
         self.edit_mode_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
@@ -717,6 +727,7 @@ class SpectracerMainWindow(QMainWindow):
         controls_layout = QHBoxLayout()
         self.open_button = QPushButton("打开")
         self.play_button = QPushButton("播放")
+        self.play_button.setToolTip("空格：播放/暂停；播放时 Shift+空格：快捷 Tap Tempo。")
 
         self.playback_rate_label = QLabel("速度")
         self.playback_rate_slider = QSlider(Qt.Orientation.Horizontal)
@@ -781,6 +792,7 @@ class SpectracerMainWindow(QMainWindow):
         self.redo_action.triggered.connect(self._redo_last_midi_edit)
         self.open_button.clicked.connect(self.open_audio_dialog)
         self.play_button.clicked.connect(self.toggle_playback)
+        self.shift_space_tap_shortcut.activated.connect(self._record_playback_tap_tempo_shortcut)
         self.space_shortcut.activated.connect(self.toggle_playback)
         self.edit_mode_shortcut.activated.connect(self._toggle_edit_mode_shortcut)
         self.place_tool_shortcut.activated.connect(lambda: self._set_editor_tool(MidiEditorTool.PLACE, persist=True))
@@ -959,6 +971,28 @@ class SpectracerMainWindow(QMainWindow):
         if self._analysis_busy and not self._analysis_primary_ready:
             return
         self.playback_engine.toggle()
+
+    def _record_playback_tap_tempo_shortcut(self, *, timestamp_seconds: float | None = None) -> None:
+        if self._analysis_busy and not self._analysis_primary_ready:
+            return
+        if self._current_result is None or self._current_channel_mode is None:
+            return
+        if not self.playback_engine.state.is_playing:
+            self._shortcut_tap_tracker.reset()
+            self.status_message.setText("请先播放音频，再按 Shift+空格打拍子。")
+            return
+
+        self._shortcut_tap_tracker.record(timestamp_seconds=timestamp_seconds)
+        estimate = self._shortcut_tap_tracker.estimate(playback_rate=self._playback_rate)
+        if estimate is None:
+            self.status_message.setText(f"快捷 Tap：已记录 {self._shortcut_tap_tracker.tap_count} 次敲击，至少再敲 1 次。")
+            return
+
+        candidate = self._shortcut_tap_tracker.build_candidate(first_beat_seconds=0.0, playback_rate=self._playback_rate, label="快捷 Tap Tempo", applies_offset=False)
+        if candidate is None:
+            return
+        self._apply_tempo_candidate_to_grid(candidate)
+        self.status_message.setText(f"快捷 Tap：已自动应用 {_format_bpm_value(candidate.bpm)} BPM（共 {estimate.tap_count} 次敲击，稳定度 {estimate.stability:.0%}，保留当前 offset）。")
 
     def _set_playback_rate(self, rate: float, *, update_slider: bool = True) -> None:
         clamped = max(0.5, min(2.0, float(rate)))
@@ -1363,11 +1397,16 @@ class SpectracerMainWindow(QMainWindow):
     def _apply_tempo_candidate_to_grid(self, candidate: object) -> None:
         if not isinstance(candidate, TempoAnalysisCandidate):
             return
-        self._apply_grid_root_bpm_offset(bpm=candidate.bpm, offset_ms=candidate.offset_ms)
+        applied_offset_ms = candidate.offset_ms if candidate.applies_offset else self._grid_settings.offset_ms
+        self._apply_grid_root_bpm_offset(bpm=candidate.bpm, offset_ms=applied_offset_ms)
         self._persist_grid_settings(selection=EventTrackSelection(EventTrackLane.TEMPO, 0))
-        self.status_message.setText(
-            f"已应用节拍候选：{candidate.bpm:.3f} BPM | 首拍 {candidate.first_beat_seconds:.3f} s | offset {candidate.offset_ms:+.1f} ms"
-        )
+        bpm_text = _format_bpm_value(candidate.bpm)
+        if candidate.applies_offset:
+            self.status_message.setText(
+                f"已应用节拍候选：{bpm_text} BPM | 首拍 {candidate.first_beat_seconds:.3f} s | offset {applied_offset_ms:+.1f} ms"
+            )
+            return
+        self.status_message.setText(f"已应用节拍候选：{bpm_text} BPM | 保留当前 offset {applied_offset_ms:+.1f} ms")
 
     def _open_grid_settings_dialog(self) -> None:
         dialog = GridSettingsDialog(
@@ -2026,6 +2065,8 @@ class SpectracerMainWindow(QMainWindow):
     def _on_playback_state_changed(self, is_playing: bool) -> None:
         self.play_button.setText("暂停" if is_playing else "播放")
         self.spectrogram_view.set_seek_on_click_enabled(not is_playing)
+        if not is_playing:
+            self._shortcut_tap_tracker.reset()
         if self._current_channel_mode is None:
             self.status_message.setText("播放中" if is_playing else "已暂停")
             return

@@ -2,8 +2,6 @@
 
 from spectracer.core.analysis_results import (
     BeatAnchor,
-    ChordAnalysisResult,
-    ChordSegment,
     TempoAnalysisCandidate,
     TempoAnalysisResult,
     TempoSegment,
@@ -38,8 +36,6 @@ __all__ = [
     "BeatAnchor",
     "TempoSegment",
     "TempoAnalysisResult",
-    "ChordSegment",
-    "ChordAnalysisResult",
     "frequency_to_midi",
     "frequency_to_note_name",
     "is_black_key",

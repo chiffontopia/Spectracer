@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectracer.core.analysis_results import TempoAnalysisCandidate, TempoAnalysisResult
 from spectracer.core.models import ChannelMode
-from spectracer.ui.dialogs.tempo_analysis_dialog import TempoAnalysisDialog
+from spectracer.ui.dialogs.tempo_analysis_dialog import TapTempoTracker, TempoAnalysisDialog
 
 
 @pytest.fixture(scope="module")
@@ -49,6 +49,20 @@ def test_tempo_analysis_dialog_interval_and_tap_candidates(qapp: QApplication) -
     assert dialog.tap_apply_button.isEnabled() is True
 
 
+def test_tap_tempo_tracker_compensates_playback_rate() -> None:
+    tracker = TapTempoTracker()
+
+    tracker.record(timestamp_seconds=0.0)
+    tracker.record(timestamp_seconds=1.0)
+    tracker.record(timestamp_seconds=2.0)
+    candidate = tracker.build_candidate(first_beat_seconds=0.0, playback_rate=0.5, label="快捷 Tap Tempo", applies_offset=False)
+
+    assert candidate is not None
+    assert candidate.bpm == pytest.approx(120.0, abs=1e-6)
+    assert candidate.applies_offset is False
+    assert candidate.offset_ms == pytest.approx(0.0, abs=1e-6)
+
+
 def test_tempo_analysis_dialog_populates_smart_candidate_table(qapp: QApplication) -> None:
     _ = qapp
     dialog = TempoAnalysisDialog(
@@ -67,6 +81,7 @@ def test_tempo_analysis_dialog_populates_smart_candidate_table(qapp: QApplicatio
                 confidence=0.72,
                 candidate_rank=1,
                 label="主候选",
+                applies_offset=False,
             ),
             TempoAnalysisCandidate(
                 bpm=150.0,
@@ -75,6 +90,7 @@ def test_tempo_analysis_dialog_populates_smart_candidate_table(qapp: QApplicatio
                 confidence=0.44,
                 candidate_rank=2,
                 label="倍速候选",
+                applies_offset=False,
             ),
         ),
     )
@@ -85,4 +101,6 @@ def test_tempo_analysis_dialog_populates_smart_candidate_table(qapp: QApplicatio
     assert dialog.smart_candidates_table.rowCount() == 2
     assert selected is not None
     assert selected.candidate_rank == 2
+    assert dialog.smart_candidates_table.item(0, 2).text() == "100"
+    assert dialog.smart_candidates_table.item(0, 4).text() == "—"
     assert "缓存结果" in dialog.smart_status_label.text()

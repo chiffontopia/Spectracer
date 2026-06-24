@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from statistics import fmean, pstdev
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -26,12 +27,77 @@ from spectracer.core.analysis_results import TempoAnalysisCandidate, TempoAnalys
 from spectracer.core.models import ChannelMode
 
 
+@dataclass(slots=True, frozen=True)
+class TapTempoEstimate:
+    bpm: float
+    confidence: float
+    stability: float
+    interval_count: int
+    tap_count: int
+
+
+class TapTempoTracker:
+    def __init__(self, *, reset_gap_seconds: float = 3.0, history_limit: int = 8) -> None:
+        self._reset_gap_seconds = max(0.1, float(reset_gap_seconds))
+        self._history_limit = max(2, int(history_limit))
+        self._timestamps: list[float] = []
+
+    @property
+    def tap_count(self) -> int:
+        return len(self._timestamps)
+
+    def record(self, *, timestamp_seconds: float | None = None) -> TapTempoEstimate | None:
+        now = time.monotonic() if timestamp_seconds is None else float(timestamp_seconds)
+        if self._timestamps and now - self._timestamps[-1] > self._reset_gap_seconds:
+            self._timestamps.clear()
+        if self._timestamps and now <= self._timestamps[-1]:
+            now = self._timestamps[-1] + 1e-6
+        self._timestamps.append(now)
+        self._timestamps = self._timestamps[-self._history_limit :]
+        return self.estimate()
+
+    def reset(self) -> None:
+        self._timestamps.clear()
+
+    def intervals(self) -> list[float]:
+        return [current - previous for previous, current in zip(self._timestamps[:-1], self._timestamps[1:]) if current > previous]
+
+    def estimate(self, *, playback_rate: float = 1.0) -> TapTempoEstimate | None:
+        intervals = self.intervals()
+        if not intervals:
+            return None
+        mean_interval = fmean(intervals)
+        if mean_interval <= 0.0:
+            return None
+        stability = 1.0
+        if len(intervals) >= 2:
+            stability = max(0.0, min(1.0, 1.0 - (pstdev(intervals) / mean_interval)))
+        confidence = max(0.25, min(1.0, 0.45 + (0.08 * len(intervals)) + (0.25 * stability)))
+        rate = max(1e-6, float(playback_rate))
+        return TapTempoEstimate((60.0 / mean_interval) / rate, confidence, stability, len(intervals), len(self._timestamps))
+
+    def build_candidate(self, *, first_beat_seconds: float, playback_rate: float = 1.0, label: str = "Tap Tempo", applies_offset: bool = True) -> TempoAnalysisCandidate | None:
+        estimate = self.estimate(playback_rate=playback_rate)
+        if estimate is None:
+            return None
+        first_beat_seconds = float(first_beat_seconds)
+        return TempoAnalysisCandidate(bpm=estimate.bpm, first_beat_seconds=first_beat_seconds, offset_ms=(first_beat_seconds * 1000.0 if applies_offset else 0.0), confidence=estimate.confidence, candidate_rank=1, label=label, applies_offset=applies_offset)
+
+
 def _format_seconds(value: float) -> str:
     return f"{float(value):.3f} s"
 
 
 def _format_offset_ms(value: float) -> str:
     return f"{float(value):+.1f} ms"
+
+
+def _format_smart_bpm(value: float) -> str:
+    return f"{max(1, int(round(float(value))))}"
+
+
+def _format_candidate_offset(candidate: TempoAnalysisCandidate) -> str:
+    return _format_offset_ms(candidate.offset_ms) if candidate.applies_offset else "—"
 
 
 class TempoAnalysisDialog(QDialog):
@@ -60,7 +126,7 @@ class TempoAnalysisDialog(QDialog):
         self._current_bpm = max(1.0, float(current_bpm))
         self._current_offset_ms = float(current_offset_ms)
         self._current_channel_mode = current_channel_mode
-        self._tap_timestamps: list[float] = []
+        self._tap_tracker = TapTempoTracker()
         self._smart_result = TempoAnalysisResult()
 
         root_layout = QVBoxLayout(self)
@@ -73,7 +139,8 @@ class TempoAnalysisDialog(QDialog):
         root_layout.addWidget(summary_label)
 
         hint_label = QLabel(
-            "手动页支持 Tap Tempo 与区间换算；智能页会给出只读候选。只有点击“应用到网格”时，才会改写当前根 BPM / offset。"
+            "手动页支持 Tap Tempo 与区间换算；智能页仅输出只读整数 BPM 候选，不估计 offset。"
+            " 应用手动结果会改写当前根 BPM / offset，应用智能结果只会更新根 BPM。"
         )
         hint_label.setWordWrap(True)
         root_layout.addWidget(hint_label)
@@ -133,7 +200,9 @@ class TempoAnalysisDialog(QDialog):
         tap_layout.addLayout(tap_button_row)
 
         self.tap_result_label = QLabel("等待至少 2 次点击…", tap_group)
-        self.tap_detail_label = QLabel("Tap 后会根据最近几次间隔计算平均 BPM，并将“首拍时间”作为 offset。", tap_group)
+        self.tap_detail_label = QLabel(
+            "Tap 后会根据最近几次间隔计算平均 BPM，并将“首拍时间”作为 offset。播放时也可按 Shift+空格进行快捷 Tap，并在得到结果后自动应用 BPM。",
+            tap_group)
         self.tap_result_label.setWordWrap(True)
         self.tap_detail_label.setWordWrap(True)
         tap_layout.addWidget(self.tap_result_label)
@@ -237,40 +306,15 @@ class TempoAnalysisDialog(QDialog):
 
     def record_tap(self, checked: bool = False, *, timestamp_seconds: float | None = None) -> None:
         _ = checked
-        now = time.monotonic() if timestamp_seconds is None else float(timestamp_seconds)
-        if self._tap_timestamps and now - self._tap_timestamps[-1] > 3.0:
-            self._tap_timestamps.clear()
-        if self._tap_timestamps and now <= self._tap_timestamps[-1]:
-            now = self._tap_timestamps[-1] + 1e-6
-        self._tap_timestamps.append(now)
-        self._tap_timestamps = self._tap_timestamps[-8:]
+        self._tap_tracker.record(timestamp_seconds=timestamp_seconds)
         self._refresh_tap_display()
 
     def reset_taps(self) -> None:
-        self._tap_timestamps.clear()
+        self._tap_tracker.reset()
         self._refresh_tap_display()
 
     def tap_candidate(self) -> TempoAnalysisCandidate | None:
-        intervals = self._tap_intervals()
-        if not intervals:
-            return None
-        mean_interval = fmean(intervals)
-        if mean_interval <= 0.0:
-            return None
-        bpm = 60.0 / mean_interval
-        stability = 1.0
-        if len(intervals) >= 2:
-            stability = max(0.0, min(1.0, 1.0 - (pstdev(intervals) / mean_interval)))
-        confidence = max(0.25, min(1.0, 0.45 + (0.08 * len(intervals)) + (0.25 * stability)))
-        first_beat_seconds = float(self.tap_first_beat_spin.value())
-        return TempoAnalysisCandidate(
-            bpm=bpm,
-            first_beat_seconds=first_beat_seconds,
-            offset_ms=first_beat_seconds * 1000.0,
-            confidence=confidence,
-            candidate_rank=1,
-            label="Tap Tempo",
-        )
+        return self._tap_tracker.build_candidate(first_beat_seconds=float(self.tap_first_beat_spin.value()))
 
     def interval_candidate(self) -> TempoAnalysisCandidate | None:
         start_seconds = float(self.interval_start_spin.value())
@@ -318,9 +362,9 @@ class TempoAnalysisDialog(QDialog):
             cells = (
                 str(candidate.candidate_rank),
                 candidate.label or "",
-                f"{candidate.bpm:.3f}",
+                _format_smart_bpm(candidate.bpm),
                 _format_seconds(candidate.first_beat_seconds),
-                _format_offset_ms(candidate.offset_ms),
+                _format_candidate_offset(candidate),
                 f"{candidate.confidence:.0%}",
             )
             for column, cell_text in enumerate(cells):
@@ -339,7 +383,8 @@ class TempoAnalysisDialog(QDialog):
             primary = ordered_candidates[selected_row]
             source_label = "已加载缓存结果" if from_cache else "智能分析完成"
             self.smart_status_label.setText(
-                f"{source_label}：共 {len(ordered_candidates)} 个候选，当前选中 {primary.bpm:.3f} BPM。"
+                f"{source_label}：共 {len(ordered_candidates)} 个候选，当前选中 {_format_smart_bpm(primary.bpm)} BPM。"
+                " 智能分析不会改写 offset。"
             )
         else:
             self.smart_status_label.setText("智能分析未返回候选。")
@@ -355,26 +400,19 @@ class TempoAnalysisDialog(QDialog):
         return ordered_candidates[current_row]
 
     def _tap_intervals(self) -> list[float]:
-        return [
-            current - previous
-            for previous, current in zip(self._tap_timestamps[:-1], self._tap_timestamps[1:])
-            if current > previous
-        ]
+        return self._tap_tracker.intervals()
 
     def _refresh_tap_display(self) -> None:
         candidate = self.tap_candidate()
-        tap_count = len(self._tap_timestamps)
+        tap_count = self._tap_tracker.tap_count
         intervals = self._tap_intervals()
         if candidate is None:
             self.tap_result_label.setText(f"已记录 {tap_count} 次点击，至少再点击 1 次才能得到 BPM。")
-            self.tap_detail_label.setText("Tap 后会根据最近几次间隔计算平均 BPM，并将“首拍时间”作为 offset。")
+            self.tap_detail_label.setText("Tap 后会根据最近几次间隔计算平均 BPM，并将“首拍时间”作为 offset。播放时也可按 Shift+空格进行快捷 Tap。")
             self.tap_apply_button.setEnabled(False)
             return
-        mean_interval = fmean(intervals)
-        spread_text = "稳定度：100%"
-        if len(intervals) >= 2:
-            stability = max(0.0, min(1.0, 1.0 - (pstdev(intervals) / mean_interval)))
-            spread_text = f"稳定度：{stability:.0%}"
+        estimate = self._tap_tracker.estimate()
+        spread_text = "稳定度：100%" if estimate is None else f"稳定度：{estimate.stability:.0%}"
         self.tap_result_label.setText(
             f"Tap 结果：{candidate.bpm:.3f} BPM | 首拍 {_format_seconds(candidate.first_beat_seconds)} | offset {_format_offset_ms(candidate.offset_ms)}"
         )
@@ -427,4 +465,4 @@ class TempoAnalysisDialog(QDialog):
         self.smart_apply_button.setEnabled(has_selection and not smart_busy)
 
 
-__all__ = ["TempoAnalysisDialog"]
+__all__ = ["TapTempoEstimate", "TapTempoTracker", "TempoAnalysisDialog"]

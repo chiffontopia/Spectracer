@@ -5,7 +5,6 @@ from spectracer.app.analysis_sidecar_workflow import (
     SidecarAnalysisExecutionOptions,
     SidecarAnalysisExecutionResult,
     SidecarAnalysisProgress,
-    execute_chord_sidecar_analysis,
     execute_tempo_sidecar_analysis,
 )
 
@@ -14,6 +13,5 @@ __all__ = [
     "SidecarAnalysisExecutionOptions",
     "SidecarAnalysisExecutionResult",
     "SidecarAnalysisProgress",
-    "execute_chord_sidecar_analysis",
     "execute_tempo_sidecar_analysis",
 ]

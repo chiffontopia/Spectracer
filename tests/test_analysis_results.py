@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from spectracer.core.analysis_results import (
     BeatAnchor,
-    ChordAnalysisResult,
-    ChordSegment,
+    CURRENT_TEMPO_ANALYSIS_SCHEMA,
+    SCHEMA_TEMPO_ANALYSIS_V1,
     TempoAnalysisCandidate,
     TempoAnalysisResult,
     TempoSegment,
@@ -54,20 +54,28 @@ def test_tempo_analysis_result_roundtrip_preserves_future_tempo_map_fields() -> 
     assert restored.primary_candidate() == result.candidates[0]
 
 
-def test_chord_analysis_result_roundtrip_preserves_readonly_segments() -> None:
-    result = ChordAnalysisResult(
-        channel_mode=ChannelMode.MONO,
-        analysis_basis="beat_synchronous",
-        window_seconds=0.5,
-        grid_aligned=True,
-        notes="只读展示",
-        segments=(
-            ChordSegment(start_seconds=0.0, end_seconds=1.0, label="C", confidence=0.91, start_beat=0.0, end_beat=2.0),
-            ChordSegment(start_seconds=1.0, end_seconds=2.0, label="G/B", confidence=0.77, start_beat=2.0, end_beat=4.0),
-        ),
+def test_tempo_analysis_result_from_legacy_schema_upgrades_to_integer_bpm_without_offset() -> None:
+    restored = TempoAnalysisResult.from_dict(
+        {
+            "schema_version": SCHEMA_TEMPO_ANALYSIS_V1,
+            "analysis_basis": "global_bpm",
+            "selected_candidate_rank": 1,
+            "candidates": [
+                {
+                    "bpm": 119.6,
+                    "first_beat_seconds": 0.18,
+                    "offset_ms": 180.0,
+                    "confidence": 0.72,
+                    "candidate_rank": 1,
+                    "label": "主候选",
+                }
+            ],
+        }
     )
 
-    restored = ChordAnalysisResult.from_dict(result.to_dict())
-
-    assert restored == result
-    assert restored.segments[1].label == "G/B"
+    candidate = restored.primary_candidate()
+    assert candidate is not None
+    assert candidate.bpm == 120.0
+    assert candidate.offset_ms == 0.0
+    assert candidate.applies_offset is False
+    assert restored.schema_version == CURRENT_TEMPO_ANALYSIS_SCHEMA
